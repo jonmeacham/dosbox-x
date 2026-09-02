@@ -41,10 +41,12 @@ using namespace std;
 #include "vga.h"
 #include "mmx.h"
 #include "mapper.h"
+#include "mouse.h"
 #include "pc98_gdc.h"
 #include "callback.h"
 #include "inout.h"
 #include "paging.h"
+#include "pic.h"
 #include "shell.h"
 #include "debug_inc.h"
 #include "../cpu/lazyflags.h"
@@ -1975,7 +1977,35 @@ void VGA_DumpFontRamBIN(const char *filename);
 void VGA_DumpFontRamBMP(const char *filename);
 int32_t DEBUG_Run(int32_t amount,bool quickexit);
 
+static void delayed_mouse_move(Bitu packed) {
+	const auto x = static_cast<int16_t>((packed >> 16u) & 0xffffu);
+	const auto y = static_cast<int16_t>(packed & 0xffffu);
+	Mouse_CursorInjected(static_cast<float>(x),static_cast<float>(y),0,0,true);
+}
+
+static void delayed_mouse_position(Bitu packed) {
+	const auto x = static_cast<uint16_t>((packed >> 16u) & 0xffffu);
+	const auto y = static_cast<uint16_t>(packed & 0xffffu);
+	Mouse_CursorInjected(0,0,
+	                     static_cast<float>(x) / 65535.0f,
+	                     static_cast<float>(y) / 65535.0f,
+	                     false);
+}
+
+static void delayed_mouse_press(Bitu button) {
+	Mouse_ButtonPressed(static_cast<uint8_t>(button));
+}
+
+static void delayed_mouse_release(Bitu button) {
+	Mouse_ButtonReleased(static_cast<uint8_t>(button));
+}
+
+static void delayed_mouse_wheel(Bitu amount) {
+	Mouse_WheelMoved(static_cast<int32_t>(static_cast<uint32_t>(amount)));
+}
+
 bool ParseCommand(char* str) {
+    const std::string original_str = str;
     std::string copy_str = str;
     for (auto &c : copy_str) c = toupper(c);
     copy_str += '\0'; /* paranoid */
@@ -2704,6 +2734,90 @@ bool ParseCommand(char* str) {
 
 		DOSBOX_SetNormalLoop();	
 		GFX_SetTitle(-1,-1,-1,is_paused);
+		return true;
+	}
+
+	if (command == "ADDKEY") {
+		const auto args_start = original_str.find_first_of(" \t");
+		if (args_start == std::string::npos) {
+			DEBUG_ShowMsg("DEBUG: ADDKEY requires one or more arguments.\n");
+			return true;
+		}
+
+		std::vector<char> args(original_str.begin() + args_start,
+		                       original_str.end());
+		args.push_back('\0');
+		DOS_Shell shell;
+		shell.CMD_ADDKEY(args.data());
+		DEBUG_ShowMsg("DEBUG: Queued artificial keypresses.\n");
+		return true;
+	}
+
+	if (command == "ADDMOUSE") {
+		std::string action;
+		uint32_t delay = 0;
+		stream >> action >> delay;
+		bool valid = !stream.fail();
+
+		if (valid && action == "MOVE") {
+			int x = 0;
+			int y = 0;
+			stream >> x >> y;
+			valid = !stream.fail() && x >= INT16_MIN && x <= INT16_MAX &&
+			        y >= INT16_MIN && y <= INT16_MAX;
+			if (valid) {
+				const auto packed =
+				        (static_cast<uint32_t>(static_cast<uint16_t>(x)) << 16u) |
+				        static_cast<uint16_t>(y);
+				PIC_AddEvent(&delayed_mouse_move,delay,packed);
+			}
+		} else if (valid && action == "POSITION") {
+			double x = 0;
+			double y = 0;
+			stream >> x >> y;
+			valid = !stream.fail() && x >= 0 && x <= 1 && y >= 0 && y <= 1;
+			if (valid) {
+				const auto packed =
+				        (static_cast<uint32_t>(x * 65535.0 + 0.5) << 16u) |
+				        static_cast<uint16_t>(y * 65535.0 + 0.5);
+				PIC_AddEvent(&delayed_mouse_position,delay,packed);
+			}
+		} else if (valid && action == "BUTTON") {
+			std::string button_name;
+			std::string state;
+			stream >> button_name >> state;
+			uint8_t button = 0;
+			if (button_name == "RIGHT") button = 1;
+			else if (button_name == "MIDDLE") button = 2;
+			else if (button_name != "LEFT") valid = false;
+			valid = valid && !stream.fail() &&
+			        (state == "PRESS" || state == "RELEASE");
+			if (valid) {
+				PIC_AddEvent(state == "PRESS" ? &delayed_mouse_press
+				                                : &delayed_mouse_release,
+				             delay,button);
+			}
+		} else if (valid && action == "WHEEL") {
+			int32_t amount = 0;
+			stream >> amount;
+			valid = !stream.fail();
+			if (valid) {
+				PIC_AddEvent(&delayed_mouse_wheel,delay,
+				             static_cast<uint32_t>(amount));
+			}
+		} else {
+			valid = false;
+		}
+
+		std::string trailing;
+		if (stream >> trailing) valid = false;
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: ADDMOUSE syntax: MOVE delay dx dy; "
+			              "POSITION delay x y; BUTTON delay button state; "
+			              "or WHEEL delay amount.\n");
+		} else {
+			DEBUG_ShowMsg("DEBUG: Queued artificial mouse event.\n");
+		}
 		return true;
 	}
 
@@ -4114,6 +4228,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("TIME [time]               - Display or change the internal time.\n");
 		DEBUG_ShowMsg("DATE [date]               - Display or change the internal date.\n");
 		DEBUG_ShowMsg("VRT                       - Run, then enter debugger at next vertical retrace.\n");
+		DEBUG_ShowMsg("ADDKEY [pmsec] [key]      - Queue artificial keypresses before resuming.\n");
+		DEBUG_ShowMsg("ADDMOUSE action delay ...  - Queue a mouse event before resuming.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
 		DEBUG_ShowMsg("OUT[P|W|D] [port] [data]  - I/O port write byte/word/dword.\n");

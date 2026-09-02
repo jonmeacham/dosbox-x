@@ -35,6 +35,7 @@ void Mouse_ChangePS2Callback(uint16_t pseg, uint16_t pofs);
 
 
 void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate);
+void Mouse_CursorInjected(float xrel,float yrel,float x,float y,bool relative);
 const char* Mouse_GetSelected(int x1, int y1, int x2, int y2, int w, int h, uint16_t *textlen);
 #if defined(WIN32) || defined(MACOSX) || defined(C_SDL2)
 void Mouse_Select(int x1, int y1, int x2, int y2, int w, int h, bool select);

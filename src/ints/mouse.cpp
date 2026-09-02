@@ -1010,6 +1010,18 @@ void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
     Mouse_AddEvent(MOUSE_HAS_MOVED);
 }
 
+void Mouse_CursorInjected(float xrel,float yrel,float x,float y,bool relative) {
+    extern MOUSE_EMULATION user_cursor_emulation;
+
+    const bool previous_locked = user_cursor_locked;
+    const MOUSE_EMULATION previous_emulation = user_cursor_emulation;
+    user_cursor_locked = relative;
+    user_cursor_emulation = MOUSE_EMULATION_ALWAYS;
+    Mouse_CursorMoved(xrel,yrel,x,y,relative);
+    user_cursor_locked = previous_locked;
+    user_cursor_emulation = previous_emulation;
+}
+
 uint8_t Mouse_GetButtonState(void) {
     return mouse.buttons;
 }

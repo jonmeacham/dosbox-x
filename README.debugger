@@ -144,6 +144,11 @@ BPINT <intnum>                              Add breakpoint on interrupt
 BPINT <intnum> <value>                      Add breakpoint on interrupt and AH=<value>
 BPLIST                                      List breakpoints
 BPDEL <breakpoint number>                   Delete breakpoint
+ADDKEY [pmsec] [key]                       Queue artificial keypresses before resuming
+ADDMOUSE MOVE <delay-ms> <dx> <dy>         Queue relative mouse motion
+ADDMOUSE POSITION <delay-ms> <x> <y>       Queue normalized absolute mouse position (0..1)
+ADDMOUSE BUTTON <delay-ms> <button> <state> Queue a left/middle/right press or release
+ADDMOUSE WHEEL <delay-ms> <amount>          Queue a mouse-wheel event
 RUN                                         Resume emulation
 RUNWATCH                                    Resume emulation, but show state while running
 A20                                         Show A20 gate state
