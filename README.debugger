@@ -156,6 +156,7 @@ ADDWATCHKEY <delay-ms> <seg>:<off> <B|W|D> <EQ|NE|LT|LE|GT|GE> <hex-value> <key>
 ADDMEMDUMP <delay-ms> <seg>:<off> <length> <file>
                                              Queue a guest-clock binary memory snapshot
 CAPTUREVIDEO START|STOP                      Control AVI capture without a host hotkey
+SAVESTATE SAVE|LOAD <slot>                   Save or load emulator slot 1..100 without focus
 RUN                                         Resume emulation
 RUNWATCH                                    Resume emulation, but show state while running
 A20                                         Show A20 gate state

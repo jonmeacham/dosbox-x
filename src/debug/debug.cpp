@@ -87,6 +87,8 @@ bool DEBUG_HaltOnRetrace = false;
 
 extern bool                 dos_kernel_disabled;
 extern bool                 is_paused;
+extern bool                 noremark_save_state;
+extern bool                 force_load_state;
 extern bool                 pc98_crt_mode;
 extern uint8_t              GDC_display_plane;
 extern uint8_t              GDC_display_plane_pending;
@@ -2910,6 +2912,50 @@ bool ParseCommand(char* str) {
 		} else {
 			CAPTURE_VideoStop();
 			DEBUG_ShowMsg("DEBUG: Video capture stopped.\n");
+		}
+		return true;
+	}
+
+	if (command == "SAVESTATE") {
+		std::string action;
+		uint32_t slot = 0;
+		stream >> action >> slot;
+		std::string trailing;
+		const bool valid = !stream.fail() && !(stream >> trailing) &&
+		                   slot >= 1 &&
+		                   slot <= SaveState::SLOT_COUNT * SaveState::MAX_PAGE &&
+		                   (action == "SAVE" || action == "LOAD");
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: SAVESTATE syntax: SAVE|LOAD slot (1..100).\n");
+			return true;
+		}
+
+		try {
+			if (action == "SAVE") {
+				const bool previous = noremark_save_state;
+				noremark_save_state = true;
+				try {
+					SaveState::instance().save(slot - 1);
+				} catch (...) {
+					noremark_save_state = previous;
+					throw;
+				}
+				noremark_save_state = previous;
+				DEBUG_ShowMsg("DEBUG: Emulator state saved to slot %u.\n",slot);
+			} else {
+				const bool previous = force_load_state;
+				force_load_state = true;
+				try {
+					SaveState::instance().load(slot - 1);
+				} catch (...) {
+					force_load_state = previous;
+					throw;
+				}
+				force_load_state = previous;
+				DEBUG_ShowMsg("DEBUG: Emulator state loaded from slot %u.\n",slot);
+			}
+		} catch (const SaveState::Error& err) {
+			DEBUG_ShowMsg("DEBUG: SAVESTATE failed: %s\n",err.c_str());
 		}
 		return true;
 	}
