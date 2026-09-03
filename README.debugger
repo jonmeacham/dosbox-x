@@ -149,6 +149,13 @@ ADDMOUSE MOVE <delay-ms> <dx> <dy>         Queue relative mouse motion
 ADDMOUSE POSITION <delay-ms> <x> <y>       Queue normalized absolute mouse position (0..1)
 ADDMOUSE BUTTON <delay-ms> <button> <state> Queue a left/middle/right press or release
 ADDMOUSE WHEEL <delay-ms> <amount>          Queue a mouse-wheel event
+ADDTICKKEY <delay-ms> <seg>:<counter-offset> <ticks> <key>
+                                             Hold a key for guest-memory ticks
+ADDWATCHKEY <delay-ms> <seg>:<off> <B|W|D> <EQ|NE|LT|LE|GT|GE> <hex-value> <key> <timeout-ms>
+                                             Hold a key until guest memory matches
+ADDMEMDUMP <delay-ms> <seg>:<off> <length> <file>
+                                             Queue a guest-clock binary memory snapshot
+CAPTUREVIDEO START|STOP                      Control AVI capture without a host hotkey
 RUN                                         Resume emulation
 RUNWATCH                                    Resume emulation, but show state while running
 A20                                         Show A20 gate state

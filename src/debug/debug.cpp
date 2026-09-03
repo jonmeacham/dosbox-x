@@ -36,6 +36,7 @@ using namespace std;
 #include "cross.h" //snprintf
 #include "fpu.h"
 #include "bios.h"
+#include "hardware.h"
 #include "timer.h"
 #include "video.h"
 #include "vga.h"
@@ -2004,6 +2005,164 @@ static void delayed_mouse_wheel(Bitu amount) {
 	Mouse_WheelMoved(static_cast<int32_t>(static_cast<uint32_t>(amount)));
 }
 
+struct ScheduledTickKey {
+	PhysPt counter_address = 0;
+	KBD_KEYS key = KBD_NONE;
+	uint32_t target_ticks = 0;
+	uint32_t elapsed_ticks = 0;
+	uint32_t last_counter = 0;
+	bool have_counter = false;
+	bool pressed = false;
+};
+
+static void delayed_tick_key(Bitu opaque) {
+	auto *request = reinterpret_cast<ScheduledTickKey *>(opaque);
+	if (!request) return;
+
+	uint32_t counter = 0;
+	if (mem_readd_checked(request->counter_address,&counter)) {
+		if (request->pressed) KEYBOARD_AddKey(request->key,false);
+		LOG_MSG("Scheduled tick key failed to read its guest counter");
+		delete request;
+		return;
+	}
+
+	if (!request->have_counter) {
+		request->last_counter = counter;
+		request->have_counter = true;
+	} else if (counter != request->last_counter) {
+		const auto delta = counter - request->last_counter;
+		request->last_counter = counter;
+		if (!request->pressed) {
+			KEYBOARD_AddKey(request->key,true);
+			request->pressed = true;
+		} else {
+			request->elapsed_ticks += delta;
+			if (request->elapsed_ticks >= request->target_ticks) {
+				KEYBOARD_AddKey(request->key,false);
+				delete request;
+				return;
+			}
+		}
+	}
+
+	PIC_AddEvent(&delayed_tick_key,0.1,
+	             reinterpret_cast<Bitu>(request));
+}
+
+enum class WatchComparison {
+	equal,
+	not_equal,
+	less,
+	less_equal,
+	greater,
+	greater_equal,
+};
+
+struct ScheduledWatchKey {
+	PhysPt address = 0;
+	KBD_KEYS key = KBD_NONE;
+	WatchComparison comparison = WatchComparison::equal;
+	uint32_t expected = 0;
+	uint8_t width = 0;
+	pic_tickindex_t deadline = 0;
+	bool pressed = false;
+};
+
+static bool watch_comparison_matches(const ScheduledWatchKey &request,
+                                     const uint32_t actual) {
+	switch (request.comparison) {
+	case WatchComparison::equal: return actual == request.expected;
+	case WatchComparison::not_equal: return actual != request.expected;
+	case WatchComparison::less: return actual < request.expected;
+	case WatchComparison::less_equal: return actual <= request.expected;
+	case WatchComparison::greater: return actual > request.expected;
+	case WatchComparison::greater_equal: return actual >= request.expected;
+	}
+	return false;
+}
+
+static void delayed_watch_key(Bitu opaque) {
+	auto *request = reinterpret_cast<ScheduledWatchKey *>(opaque);
+	if (!request) return;
+
+	uint32_t actual = 0;
+	bool failed = false;
+	if (request->width == 1) {
+		uint8_t value = 0;
+		failed = mem_readb_checked(request->address,&value);
+		actual = value;
+	} else if (request->width == 2) {
+		uint16_t value = 0;
+		failed = mem_readw_checked(request->address,&value);
+		actual = value;
+	} else {
+		failed = mem_readd_checked(request->address,&actual);
+	}
+	const bool matched = !failed && watch_comparison_matches(*request,actual);
+
+	// A state-watched hold is also useful as an idempotent correction after a
+	// coarse crossing watch. Do not create a new guest key edge when the target
+	// state already satisfies the predicate at the scheduled start boundary.
+	if (!request->pressed && matched) {
+		delete request;
+		return;
+	}
+	if (!request->pressed && !failed && PIC_FullIndex() < request->deadline) {
+		KEYBOARD_AddKey(request->key,true);
+		request->pressed = true;
+		PIC_AddEvent(&delayed_watch_key,0.1,
+		             reinterpret_cast<Bitu>(request));
+		return;
+	}
+
+	if (failed || matched ||
+	    PIC_FullIndex() >= request->deadline) {
+		if (request->pressed) KEYBOARD_AddKey(request->key,false);
+		if (failed) {
+			LOG_MSG("Scheduled watch key failed to read guest memory");
+		} else if (!matched) {
+			LOG_MSG("Scheduled watch key timed out");
+		}
+		delete request;
+		return;
+	}
+
+	PIC_AddEvent(&delayed_watch_key,0.1,
+	             reinterpret_cast<Bitu>(request));
+}
+
+struct ScheduledMemoryDump {
+	PhysPt address = 0;
+	uint32_t length = 0;
+	std::string filename = {};
+};
+
+static void delayed_memory_dump(Bitu opaque) {
+	auto *request = reinterpret_cast<ScheduledMemoryDump *>(opaque);
+	if (!request) return;
+
+	std::ofstream output(request->filename,
+	                     std::ios::binary | std::ios::trunc);
+	if (!output) {
+		LOG_MSG("Scheduled memory dump failed to open '%s'",
+		        request->filename.c_str());
+		delete request;
+		return;
+	}
+
+	for (uint32_t offset = 0; offset < request->length; ++offset) {
+		uint8_t value = 0;
+		mem_readb_checked(request->address + offset,&value);
+		output.put(static_cast<char>(value));
+	}
+	if (!output) {
+		LOG_MSG("Scheduled memory dump failed while writing '%s'",
+		        request->filename.c_str());
+	}
+	delete request;
+}
+
 bool ParseCommand(char* str) {
     const std::string original_str = str;
     std::string copy_str = str;
@@ -2737,6 +2896,24 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	if (command == "CAPTUREVIDEO") {
+		std::string action;
+		stream >> action;
+		std::string trailing;
+		const bool valid = !stream.fail() && !(stream >> trailing) &&
+		                   (action == "START" || action == "STOP");
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: CAPTUREVIDEO syntax: START|STOP.\n");
+		} else if (action == "START") {
+			CAPTURE_VideoStart();
+			DEBUG_ShowMsg("DEBUG: Video capture started.\n");
+		} else {
+			CAPTURE_VideoStop();
+			DEBUG_ShowMsg("DEBUG: Video capture stopped.\n");
+		}
+		return true;
+	}
+
 	if (command == "ADDKEY") {
 		const auto args_start = original_str.find_first_of(" \t");
 		if (args_start == std::string::npos) {
@@ -2817,6 +2994,199 @@ bool ParseCommand(char* str) {
 			              "or WHEEL delay amount.\n");
 		} else {
 			DEBUG_ShowMsg("DEBUG: Queued artificial mouse event.\n");
+		}
+		return true;
+	}
+
+	if (command == "ADDTICKKEY") {
+		uint32_t delay = 0;
+		std::string address_text;
+		uint32_t ticks = 0;
+		std::string key_name;
+		stream >> delay >> address_text >> ticks >> key_name;
+		bool valid = !stream.fail() && ticks > 0;
+
+		uint32_t segment = 0;
+		uint32_t offset = 0;
+		const auto colon = address_text.find(':');
+		if (valid && colon != std::string::npos && colon > 0 &&
+		    colon + 1 < address_text.size()) {
+			char *end = nullptr;
+			segment = static_cast<uint32_t>(
+			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
+			valid = end && *end == '\0' && segment <= UINT16_MAX;
+			if (valid) {
+				offset = static_cast<uint32_t>(std::strtoul(
+				        address_text.substr(colon + 1).c_str(),&end,16));
+				valid = end && *end == '\0';
+			}
+		} else {
+			valid = false;
+		}
+
+		KBD_KEYS key = KBD_NONE;
+		if (key_name == "UP") key = KBD_up;
+		else if (key_name == "DOWN") key = KBD_down;
+		else if (key_name == "LEFT") key = KBD_left;
+		else if (key_name == "RIGHT") key = KBD_right;
+		else if (key_name == "ENTER") key = KBD_enter;
+		else if (key_name == "SPACE") key = KBD_space;
+		else if (key_name == "ESCAPE" || key_name == "ESC") key = KBD_esc;
+		else valid = false;
+
+		std::string trailing;
+		if (stream >> trailing) valid = false;
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: ADDTICKKEY syntax: delay-ms "
+			              "segment:counter-offset ticks key.\n");
+		} else {
+			auto *request = new ScheduledTickKey;
+			request->counter_address =
+			        GetAddress(static_cast<uint16_t>(segment),offset);
+			request->key = key;
+			request->target_ticks = ticks;
+			PIC_AddEvent(&delayed_tick_key,delay,
+			             reinterpret_cast<Bitu>(request));
+			DEBUG_ShowMsg("DEBUG: Queued guest-tick keypress.\n");
+		}
+		return true;
+	}
+
+	if (command == "ADDWATCHKEY") {
+		uint32_t delay = 0;
+		std::string address_text;
+		std::string width_text;
+		std::string comparison_text;
+		std::string expected_text;
+		std::string key_name;
+		uint32_t timeout = 0;
+		stream >> delay >> address_text >> width_text >> comparison_text
+		       >> expected_text >> key_name >> timeout;
+		bool valid = !stream.fail() && timeout > 0;
+
+		uint32_t segment = 0;
+		uint32_t offset = 0;
+		const auto colon = address_text.find(':');
+		if (valid && colon != std::string::npos && colon > 0 &&
+		    colon + 1 < address_text.size()) {
+			char *end = nullptr;
+			segment = static_cast<uint32_t>(
+			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
+			valid = end && *end == '\0' && segment <= UINT16_MAX;
+			if (valid) {
+				offset = static_cast<uint32_t>(std::strtoul(
+				        address_text.substr(colon + 1).c_str(),&end,16));
+				valid = end && *end == '\0';
+			}
+		} else {
+			valid = false;
+		}
+
+		uint8_t width = 0;
+		if (width_text == "B") width = 1;
+		else if (width_text == "W") width = 2;
+		else if (width_text == "D") width = 4;
+		else valid = false;
+
+		WatchComparison comparison = WatchComparison::equal;
+		if (comparison_text == "EQ") comparison = WatchComparison::equal;
+		else if (comparison_text == "NE") comparison = WatchComparison::not_equal;
+		else if (comparison_text == "LT") comparison = WatchComparison::less;
+		else if (comparison_text == "LE") comparison = WatchComparison::less_equal;
+		else if (comparison_text == "GT") comparison = WatchComparison::greater;
+		else if (comparison_text == "GE") comparison = WatchComparison::greater_equal;
+		else valid = false;
+
+		uint32_t expected = 0;
+		if (valid) {
+			char *end = nullptr;
+			expected = static_cast<uint32_t>(
+			        std::strtoul(expected_text.c_str(),&end,16));
+			valid = end && *end == '\0' &&
+			        (width == 4 || expected < (1u << (width * 8u)));
+		}
+
+		KBD_KEYS key = KBD_NONE;
+		if (key_name == "UP") key = KBD_up;
+		else if (key_name == "DOWN") key = KBD_down;
+		else if (key_name == "LEFT") key = KBD_left;
+		else if (key_name == "RIGHT") key = KBD_right;
+		else if (key_name == "ENTER") key = KBD_enter;
+		else if (key_name == "SPACE") key = KBD_space;
+		else if (key_name == "ESCAPE" || key_name == "ESC") key = KBD_esc;
+		else valid = false;
+
+		std::string trailing;
+		if (stream >> trailing) valid = false;
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: ADDWATCHKEY syntax: delay-ms "
+			              "segment:offset B|W|D EQ|NE|LT|LE|GT|GE "
+			              "hex-value key timeout-ms.\n");
+		} else {
+			auto *request = new ScheduledWatchKey;
+			request->address =
+			        GetAddress(static_cast<uint16_t>(segment),offset);
+			request->key = key;
+			request->comparison = comparison;
+			request->expected = expected;
+			request->width = width;
+			request->deadline = PIC_FullIndex() + delay + timeout;
+			PIC_AddEvent(&delayed_watch_key,delay,
+			             reinterpret_cast<Bitu>(request));
+			DEBUG_ShowMsg("DEBUG: Queued guest-memory watch keypress.\n");
+		}
+		return true;
+	}
+
+	if (command == "ADDMEMDUMP") {
+		std::istringstream original_stream(original_str);
+		std::string original_command;
+		std::string address_text;
+		std::string length_text;
+		std::string filename;
+		uint32_t delay = 0;
+		original_stream >> original_command >> delay >> address_text
+		                >> length_text >> filename;
+		bool valid = !original_stream.fail();
+
+		uint32_t segment = 0;
+		uint32_t offset = 0;
+		uint32_t length = 0;
+		const auto colon = address_text.find(':');
+		if (valid && colon != std::string::npos && colon > 0 &&
+		    colon + 1 < address_text.size()) {
+			char *end = nullptr;
+			segment = static_cast<uint32_t>(
+			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
+			valid = end && *end == '\0' && segment <= UINT16_MAX;
+			if (valid) {
+				offset = static_cast<uint32_t>(std::strtoul(
+				        address_text.substr(colon + 1).c_str(),&end,16));
+				valid = end && *end == '\0';
+			}
+			if (valid) {
+				length = static_cast<uint32_t>(
+				        std::strtoul(length_text.c_str(),&end,16));
+				valid = end && *end == '\0' && length > 0 &&
+				        length <= 16u * 1024u * 1024u;
+			}
+		} else {
+			valid = false;
+		}
+
+		std::string trailing;
+		if (original_stream >> trailing) valid = false;
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: ADDMEMDUMP syntax: delay-ms "
+			              "segment:offset hex-length filename.\n");
+		} else {
+			auto *request = new ScheduledMemoryDump;
+			request->address = GetAddress(static_cast<uint16_t>(segment),offset);
+			request->length = length;
+			request->filename = filename;
+			PIC_AddEvent(&delayed_memory_dump,delay,
+			             reinterpret_cast<Bitu>(request));
+			DEBUG_ShowMsg("DEBUG: Queued guest-clock memory dump.\n");
 		}
 		return true;
 	}
@@ -4228,8 +4598,12 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("TIME [time]               - Display or change the internal time.\n");
 		DEBUG_ShowMsg("DATE [date]               - Display or change the internal date.\n");
 		DEBUG_ShowMsg("VRT                       - Run, then enter debugger at next vertical retrace.\n");
+		DEBUG_ShowMsg("CAPTUREVIDEO START|STOP   - Control AVI capture without a host hotkey.\n");
 		DEBUG_ShowMsg("ADDKEY [pmsec] [key]      - Queue artificial keypresses before resuming.\n");
 		DEBUG_ShowMsg("ADDMOUSE action delay ...  - Queue a mouse event before resuming.\n");
+		DEBUG_ShowMsg("ADDTICKKEY delay s:o n key - Hold a key for guest-memory ticks.\n");
+		DEBUG_ShowMsg("ADDWATCHKEY delay s:o ...  - Hold a key until memory matches.\n");
+		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
 		DEBUG_ShowMsg("OUT[P|W|D] [port] [data]  - I/O port write byte/word/dword.\n");
