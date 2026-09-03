@@ -2134,6 +2134,86 @@ static void delayed_watch_key(Bitu opaque) {
 	             reinterpret_cast<Bitu>(request));
 }
 
+struct ScheduledSeekKey {
+	PhysPt address = 0;
+	KBD_KEYS below_key = KBD_NONE;
+	KBD_KEYS above_key = KBD_NONE;
+	KBD_KEYS pressed_key = KBD_NONE;
+	uint32_t expected = 0;
+	uint32_t tolerance = 0;
+	uint64_t modulus = 0;
+	uint8_t width = 0;
+	pic_tickindex_t deadline = 0;
+};
+
+static void delayed_seek_key(Bitu opaque) {
+	auto *request = reinterpret_cast<ScheduledSeekKey *>(opaque);
+	if (!request) return;
+
+	uint32_t actual = 0;
+	bool failed = false;
+	if (request->width == 1) {
+		uint8_t value = 0;
+		failed = mem_readb_checked(request->address,&value);
+		actual = value;
+	} else if (request->width == 2) {
+		uint16_t value = 0;
+		failed = mem_readw_checked(request->address,&value);
+		actual = value;
+	} else {
+		failed = mem_readd_checked(request->address,&actual);
+	}
+
+	int64_t circular_delta = 0;
+	uint32_t lower = 0;
+	uint32_t upper = 0;
+	bool matched = false;
+	if (!failed && request->modulus > 0) {
+		const auto normalized_actual =
+		        static_cast<uint64_t>(actual) % request->modulus;
+		circular_delta = static_cast<int64_t>(request->expected) -
+		                 static_cast<int64_t>(normalized_actual);
+		const auto half = static_cast<int64_t>(request->modulus / 2);
+		if (circular_delta > half)
+			circular_delta -= static_cast<int64_t>(request->modulus);
+		else if (circular_delta < -half)
+			circular_delta += static_cast<int64_t>(request->modulus);
+		matched = std::abs(circular_delta) <=
+		          static_cast<int64_t>(request->tolerance);
+	} else if (!failed) {
+		lower = request->expected - request->tolerance;
+		upper = request->expected + request->tolerance;
+		matched = actual >= lower && actual <= upper;
+	}
+	if (failed || matched || PIC_FullIndex() >= request->deadline) {
+		if (request->pressed_key != KBD_NONE)
+			KEYBOARD_AddKey(request->pressed_key,false);
+		if (failed) {
+			LOG_MSG("Scheduled seek key failed to read guest memory");
+		} else if (!matched) {
+			LOG_MSG("Scheduled seek key timed out");
+		}
+		delete request;
+		return;
+	}
+
+	const auto desired_key = request->modulus > 0
+	                               ? (circular_delta > 0
+	                                          ? request->below_key
+	                                          : request->above_key)
+	                               : (actual < lower
+	                                          ? request->below_key
+	                                          : request->above_key);
+	if (request->pressed_key != desired_key) {
+		if (request->pressed_key != KBD_NONE)
+			KEYBOARD_AddKey(request->pressed_key,false);
+		KEYBOARD_AddKey(desired_key,true);
+		request->pressed_key = desired_key;
+	}
+	PIC_AddEvent(&delayed_seek_key,0.1,
+	             reinterpret_cast<Bitu>(request));
+}
+
 struct ScheduledMemoryDump {
 	PhysPt address = 0;
 	uint32_t length = 0;
@@ -3180,6 +3260,119 @@ bool ParseCommand(char* str) {
 			PIC_AddEvent(&delayed_watch_key,delay,
 			             reinterpret_cast<Bitu>(request));
 			DEBUG_ShowMsg("DEBUG: Queued guest-memory watch keypress.\n");
+		}
+		return true;
+	}
+
+	if (command == "ADDSEEKKEY") {
+		uint32_t delay = 0;
+		std::string address_text;
+		std::string width_text;
+		std::string expected_text;
+		std::string tolerance_text;
+		std::string below_key_name;
+		std::string above_key_name;
+		std::string modulus_text;
+		uint32_t timeout = 0;
+		stream >> delay >> address_text >> width_text >> expected_text
+		       >> tolerance_text >> below_key_name >> above_key_name >> timeout;
+		bool valid = !stream.fail() && timeout > 0;
+
+		uint32_t segment = 0;
+		uint32_t offset = 0;
+		const auto colon = address_text.find(':');
+		if (valid && colon != std::string::npos && colon > 0 &&
+		    colon + 1 < address_text.size()) {
+			char *end = nullptr;
+			segment = static_cast<uint32_t>(
+			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
+			valid = end && *end == '\0' && segment <= UINT16_MAX;
+			if (valid) {
+				offset = static_cast<uint32_t>(std::strtoul(
+				        address_text.substr(colon + 1).c_str(),&end,16));
+				valid = end && *end == '\0';
+			}
+		} else {
+			valid = false;
+		}
+
+		uint8_t width = 0;
+		uint64_t maximum = 0;
+		if (width_text == "B") {
+			width = 1;
+			maximum = UINT8_MAX;
+		} else if (width_text == "W") {
+			width = 2;
+			maximum = UINT16_MAX;
+		} else if (width_text == "D") {
+			width = 4;
+			maximum = UINT32_MAX;
+		} else {
+			valid = false;
+		}
+
+		uint32_t expected = 0;
+		uint32_t tolerance = 0;
+		uint64_t modulus = 0;
+		if (valid) {
+			char *end = nullptr;
+			expected = static_cast<uint32_t>(
+			        std::strtoul(expected_text.c_str(),&end,16));
+			valid = end && *end == '\0';
+			if (valid) {
+				tolerance = static_cast<uint32_t>(
+				        std::strtoul(tolerance_text.c_str(),&end,16));
+				valid = end && *end == '\0';
+			}
+		}
+		if (valid && stream >> modulus_text) {
+			char *end = nullptr;
+			modulus = std::strtoull(modulus_text.c_str(),&end,16);
+			valid = end && *end == '\0' && modulus >= 2 &&
+			        modulus <= maximum + 1 && expected < modulus &&
+			        static_cast<uint64_t>(tolerance) * 2 <= modulus;
+		} else if (valid) {
+			valid = tolerance <= expected &&
+			        static_cast<uint64_t>(expected) + tolerance <= maximum;
+		}
+
+		auto parse_key = [](const std::string &name, KBD_KEYS &key) {
+			if (name == "UP") key = KBD_up;
+			else if (name == "DOWN") key = KBD_down;
+			else if (name == "LEFT") key = KBD_left;
+			else if (name == "RIGHT") key = KBD_right;
+			else if (name == "ENTER") key = KBD_enter;
+			else if (name == "SPACE") key = KBD_space;
+			else if (name == "ESCAPE" || name == "ESC") key = KBD_esc;
+			else return false;
+			return true;
+		};
+		KBD_KEYS below_key = KBD_NONE;
+		KBD_KEYS above_key = KBD_NONE;
+		valid = valid && parse_key(below_key_name,below_key) &&
+		        parse_key(above_key_name,above_key) &&
+		        below_key != above_key;
+
+		std::string trailing;
+		if (stream >> trailing) valid = false;
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: ADDSEEKKEY syntax: delay-ms "
+			              "segment:offset B|W|D hex-value hex-tolerance "
+			              "below-key above-key timeout-ms [hex-modulus].\n");
+		} else {
+			auto *request = new ScheduledSeekKey;
+			request->address =
+			        GetAddress(static_cast<uint16_t>(segment),offset);
+			request->below_key = below_key;
+			request->above_key = above_key;
+			request->expected = expected;
+			request->tolerance = tolerance;
+			request->modulus = modulus;
+			request->width = width;
+			request->deadline = PIC_FullIndex() + delay + timeout;
+			PIC_AddEvent(&delayed_seek_key,delay,
+			             reinterpret_cast<Bitu>(request));
+			DEBUG_ShowMsg("DEBUG: Queued guest-memory seek keypress.\n");
 		}
 		return true;
 	}
@@ -4649,6 +4842,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDMOUSE action delay ...  - Queue a mouse event before resuming.\n");
 		DEBUG_ShowMsg("ADDTICKKEY delay s:o n key - Hold a key for guest-memory ticks.\n");
 		DEBUG_ShowMsg("ADDWATCHKEY delay s:o ...  - Hold a key until memory matches.\n");
+		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
