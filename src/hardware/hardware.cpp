@@ -640,11 +640,23 @@ FILE * OpenCaptureFile(const char * type,const char * ext) {
 
 #if (C_SSHOT)
 static void CAPTURE_AddAviChunk(const char * tag, uint32_t size, void * data, uint32_t flags, unsigned int streamindex) {
-    (void)tag;//UNUSED
 	if (capture.video.writer != NULL) {
 		if ((int)streamindex < capture.video.writer->avi_stream_alloc) {
 			avi_writer_stream *os = capture.video.writer->avi_stream + streamindex;
-			avi_writer_stream_write(capture.video.writer,os,data,size,flags);
+            // Opt-in native-video/PIC alignment for focus-free debugger runs.
+            // Use the writer's actual chunk ordinal (including empty frames),
+            // not capture.video.frames, which can follow encoder skip rules.
+            static const bool trace_pic = []() {
+                const char *value = getenv("DOSBOX_X_CAPTURE_PIC_TIMESTAMPS");
+                return value != NULL && strcmp(value, "1") == 0;
+            }();
+            const unsigned int frame = os->sample_write_chunk;
+            const double pic_ms = trace_pic ? PIC_FullIndex() : 0.0;
+            if (avi_writer_stream_write(capture.video.writer,os,data,size,flags)
+                    && trace_pic && streamindex == 0 && strcmp(tag, "00dc") == 0) {
+                LOG_MSG("CAPTURE_VIDEO_PIC frame=%u pic_ms=%.6f bytes=%u file=%s",
+                        frame, pic_ms, size, pathvid.c_str());
+            }
 		}
 	}
 }
