@@ -2099,7 +2099,35 @@ enum class WatchComparison {
 	greater_equal,
 };
 
+// Guest-scheduled probes report edges rather than every 0.1 ms poll. This
+// observes replay timing without introducing host input or changing deadlines.
+static uint32_t scheduled_key_trace_id = 0;
+
+static const char *scheduled_key_name(const KBD_KEYS key) {
+    switch (key) {
+    case KBD_up: return "up";
+    case KBD_down: return "down";
+    case KBD_left: return "left";
+    case KBD_right: return "right";
+    case KBD_enter: return "enter";
+    case KBD_space: return "space";
+    case KBD_esc: return "escape";
+    default: return "none";
+    }
+}
+
+static void trace_scheduled_key(const char *kind, const uint32_t id,
+                                const char *event, const KBD_KEYS key,
+                                const PhysPt address, const uint32_t actual,
+                                const char *reason) {
+    LOG_MSG("SCHEDULED_KEY kind=%s id=%u event=%s pic_ms=%.6f key=%s "
+            "address=%08X actual=%08X reason=%s", kind, id, event,
+            static_cast<double>(PIC_FullIndex()), scheduled_key_name(key),
+            static_cast<unsigned int>(address), actual, reason);
+}
+
 struct ScheduledWatchKey {
+	uint32_t trace_id = 0;
 	PhysPt address = 0;
 	KBD_KEYS key = KBD_NONE;
 	WatchComparison comparison = WatchComparison::equal;
@@ -2145,12 +2173,16 @@ static void delayed_watch_key(Bitu opaque) {
 	// coarse crossing watch. Do not create a new guest key edge when the target
 	// state already satisfies the predicate at the scheduled start boundary.
 	if (!request->pressed && matched) {
+		trace_scheduled_key("watch", request->trace_id, "end", KBD_NONE,
+		                    request->address, actual, "matched");
 		delete request;
 		return;
 	}
 	if (!request->pressed && !failed && PIC_FullIndex() < request->deadline) {
 		KEYBOARD_AddKey(request->key,true);
 		request->pressed = true;
+		trace_scheduled_key("watch", request->trace_id, "press", request->key,
+		                    request->address, actual, "active");
 		PIC_AddEvent(&delayed_watch_key,0.1,
 		             reinterpret_cast<Bitu>(request));
 		return;
@@ -2158,7 +2190,14 @@ static void delayed_watch_key(Bitu opaque) {
 
 	if (failed || matched ||
 	    PIC_FullIndex() >= request->deadline) {
-		if (request->pressed) KEYBOARD_AddKey(request->key,false);
+		const char *reason = failed ? "read-failed" : matched ? "matched" : "timeout";
+		if (request->pressed) {
+			KEYBOARD_AddKey(request->key,false);
+			trace_scheduled_key("watch", request->trace_id, "release", request->key,
+			                    request->address, actual, reason);
+		}
+		trace_scheduled_key("watch", request->trace_id, "end", KBD_NONE,
+		                    request->address, actual, reason);
 		if (failed) {
 			LOG_MSG("Scheduled watch key failed to read guest memory");
 		} else if (!matched) {
@@ -2173,6 +2212,7 @@ static void delayed_watch_key(Bitu opaque) {
 }
 
 struct ScheduledSeekKey {
+	uint32_t trace_id = 0;
 	PhysPt address = 0;
 	KBD_KEYS below_key = KBD_NONE;
 	KBD_KEYS above_key = KBD_NONE;
@@ -2224,8 +2264,14 @@ static void delayed_seek_key(Bitu opaque) {
 		matched = actual >= lower && actual <= upper;
 	}
 	if (failed || matched || PIC_FullIndex() >= request->deadline) {
-		if (request->pressed_key != KBD_NONE)
+		const char *reason = failed ? "read-failed" : matched ? "matched" : "timeout";
+		if (request->pressed_key != KBD_NONE) {
 			KEYBOARD_AddKey(request->pressed_key,false);
+			trace_scheduled_key("seek", request->trace_id, "release", request->pressed_key,
+			                    request->address, actual, reason);
+		}
+		trace_scheduled_key("seek", request->trace_id, "end", KBD_NONE,
+		                    request->address, actual, reason);
 		if (failed) {
 			LOG_MSG("Scheduled seek key failed to read guest memory");
 		} else if (!matched) {
@@ -2243,9 +2289,14 @@ static void delayed_seek_key(Bitu opaque) {
 	                                          ? request->below_key
 	                                          : request->above_key);
 	if (request->pressed_key != desired_key) {
-		if (request->pressed_key != KBD_NONE)
+		if (request->pressed_key != KBD_NONE) {
 			KEYBOARD_AddKey(request->pressed_key,false);
+			trace_scheduled_key("seek", request->trace_id, "release", request->pressed_key,
+			                    request->address, actual, "switch");
+		}
 		KEYBOARD_AddKey(desired_key,true);
+		trace_scheduled_key("seek", request->trace_id, "press", desired_key,
+		                    request->address, actual, "active");
 		request->pressed_key = desired_key;
 	}
 	PIC_AddEvent(&delayed_seek_key,0.1,
@@ -3410,6 +3461,7 @@ bool ParseCommand(char* str) {
 			              "hex-value key timeout-ms.\n");
 		} else {
 			auto *request = new ScheduledWatchKey;
+			request->trace_id = ++scheduled_key_trace_id;
 			request->address = watch_address;
 			request->key = key;
 			request->comparison = comparison;
@@ -3505,6 +3557,7 @@ bool ParseCommand(char* str) {
 			              "below-key above-key timeout-ms [hex-modulus].\n");
 		} else {
 			auto *request = new ScheduledSeekKey;
+			request->trace_id = ++scheduled_key_trace_id;
 			request->address = seek_address;
 			request->below_key = below_key;
 			request->above_key = above_key;
