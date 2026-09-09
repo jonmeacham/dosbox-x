@@ -484,6 +484,43 @@ uint64_t GetAddress(uint16_t seg, uint32_t offset)
 	return ((uint64_t)seg<<4u)+offset;
 }
 
+/* Scheduled guest probes also run while DEBUGBOX is still in real mode.  A
+ * PHYS: address bypasses segment-offset normalization and names a linear
+ * physical address directly; ordinary selector:offset syntax remains
+ * unchanged for all existing debugger commands. */
+static bool ParseScheduledAddress(const std::string &text, uint64_t &address,
+                                  const bool legacy_zero_physical = false)
+{
+	if (text.rfind("PHYS:",0) == 0) {
+		const auto value = text.substr(5);
+		if (value.empty() || value.front() == '-' || value.front() == '+') return false;
+		try {
+			size_t used = 0;
+			address = std::stoull(value,&used,16);
+			return used == value.size() && address <= UINT32_MAX;
+		} catch (...) {
+			return false;
+		}
+	}
+	const auto colon = text.find(':');
+	if (colon == std::string::npos || colon == 0 || colon + 1 >= text.size()) return false;
+	try {
+		size_t used = 0;
+		const auto segment = std::stoull(text.substr(0,colon),&used,16);
+		if (used != colon || segment > UINT16_MAX) return false;
+		const auto offset = text.substr(colon + 1);
+		used = 0;
+		const auto value = std::stoull(offset,&used,16);
+		if (used != offset.size() || value > UINT32_MAX) return false;
+		// ADDEXECDUMP already documented segment zero as a linear address.
+		address = legacy_zero_physical && segment == 0 ? value
+		        : GetAddress(static_cast<uint16_t>(segment),static_cast<uint32_t>(value));
+		return address != mem_no_address;
+	} catch (...) {
+		return false;
+	}
+}
+
 static char empty_sel[] = { ' ',' ',0 };
 
 bool GetDescriptorInfo(char* selname, char* out1, char* out2)
@@ -3286,23 +3323,8 @@ bool ParseCommand(char* str) {
 		stream >> delay >> address_text >> ticks >> key_name;
 		bool valid = !stream.fail() && ticks > 0;
 
-		uint32_t segment = 0;
-		uint32_t offset = 0;
-		const auto colon = address_text.find(':');
-		if (valid && colon != std::string::npos && colon > 0 &&
-		    colon + 1 < address_text.size()) {
-			char *end = nullptr;
-			segment = static_cast<uint32_t>(
-			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
-			valid = end && *end == '\0' && segment <= UINT16_MAX;
-			if (valid) {
-				offset = static_cast<uint32_t>(std::strtoul(
-				        address_text.substr(colon + 1).c_str(),&end,16));
-				valid = end && *end == '\0';
-			}
-		} else {
-			valid = false;
-		}
+		uint64_t counter_address = 0;
+		valid = valid && ParseScheduledAddress(address_text,counter_address);
 
 		KBD_KEYS key = KBD_NONE;
 		if (key_name == "UP") key = KBD_up;
@@ -3318,11 +3340,10 @@ bool ParseCommand(char* str) {
 		if (stream >> trailing) valid = false;
 		if (!valid) {
 			DEBUG_ShowMsg("DEBUG: ADDTICKKEY syntax: delay-ms "
-			              "segment:counter-offset ticks key.\n");
+			              "segment:offset|PHYS:address ticks key.\n");
 		} else {
 			auto *request = new ScheduledTickKey;
-			request->counter_address =
-			        GetAddress(static_cast<uint16_t>(segment),offset);
+			request->counter_address = counter_address;
 			request->key = key;
 			request->target_ticks = ticks;
 			PIC_AddEvent(&delayed_tick_key,delay,
@@ -3344,23 +3365,8 @@ bool ParseCommand(char* str) {
 		       >> expected_text >> key_name >> timeout;
 		bool valid = !stream.fail() && timeout > 0;
 
-		uint32_t segment = 0;
-		uint32_t offset = 0;
-		const auto colon = address_text.find(':');
-		if (valid && colon != std::string::npos && colon > 0 &&
-		    colon + 1 < address_text.size()) {
-			char *end = nullptr;
-			segment = static_cast<uint32_t>(
-			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
-			valid = end && *end == '\0' && segment <= UINT16_MAX;
-			if (valid) {
-				offset = static_cast<uint32_t>(std::strtoul(
-				        address_text.substr(colon + 1).c_str(),&end,16));
-				valid = end && *end == '\0';
-			}
-		} else {
-			valid = false;
-		}
+		uint64_t watch_address = 0;
+		valid = valid && ParseScheduledAddress(address_text,watch_address);
 
 		uint8_t width = 0;
 		if (width_text == "B") width = 1;
@@ -3400,12 +3406,11 @@ bool ParseCommand(char* str) {
 		if (stream >> trailing) valid = false;
 		if (!valid) {
 			DEBUG_ShowMsg("DEBUG: ADDWATCHKEY syntax: delay-ms "
-			              "segment:offset B|W|D EQ|NE|LT|LE|GT|GE "
+			              "segment:offset|PHYS:address B|W|D EQ|NE|LT|LE|GT|GE "
 			              "hex-value key timeout-ms.\n");
 		} else {
 			auto *request = new ScheduledWatchKey;
-			request->address =
-			        GetAddress(static_cast<uint16_t>(segment),offset);
+			request->address = watch_address;
 			request->key = key;
 			request->comparison = comparison;
 			request->expected = expected;
@@ -3432,23 +3437,8 @@ bool ParseCommand(char* str) {
 		       >> tolerance_text >> below_key_name >> above_key_name >> timeout;
 		bool valid = !stream.fail() && timeout > 0;
 
-		uint32_t segment = 0;
-		uint32_t offset = 0;
-		const auto colon = address_text.find(':');
-		if (valid && colon != std::string::npos && colon > 0 &&
-		    colon + 1 < address_text.size()) {
-			char *end = nullptr;
-			segment = static_cast<uint32_t>(
-			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
-			valid = end && *end == '\0' && segment <= UINT16_MAX;
-			if (valid) {
-				offset = static_cast<uint32_t>(std::strtoul(
-				        address_text.substr(colon + 1).c_str(),&end,16));
-				valid = end && *end == '\0';
-			}
-		} else {
-			valid = false;
-		}
+		uint64_t seek_address = 0;
+		valid = valid && ParseScheduledAddress(address_text,seek_address);
 
 		uint8_t width = 0;
 		uint64_t maximum = 0;
@@ -3515,8 +3505,7 @@ bool ParseCommand(char* str) {
 			              "below-key above-key timeout-ms [hex-modulus].\n");
 		} else {
 			auto *request = new ScheduledSeekKey;
-			request->address =
-			        GetAddress(static_cast<uint16_t>(segment),offset);
+			request->address = seek_address;
 			request->below_key = below_key;
 			request->above_key = above_key;
 			request->expected = expected;
@@ -3542,39 +3531,24 @@ bool ParseCommand(char* str) {
 		                >> length_text >> filename;
 		bool valid = !original_stream.fail();
 
-		uint32_t segment = 0;
-		uint32_t offset = 0;
+		uint64_t dump_address = 0;
 		uint32_t length = 0;
-		const auto colon = address_text.find(':');
-		if (valid && colon != std::string::npos && colon > 0 &&
-		    colon + 1 < address_text.size()) {
+		valid = valid && ParseScheduledAddress(address_text,dump_address);
+		if (valid) {
 			char *end = nullptr;
-			segment = static_cast<uint32_t>(
-			        std::strtoul(address_text.substr(0,colon).c_str(),&end,16));
-			valid = end && *end == '\0' && segment <= UINT16_MAX;
-			if (valid) {
-				offset = static_cast<uint32_t>(std::strtoul(
-				        address_text.substr(colon + 1).c_str(),&end,16));
-				valid = end && *end == '\0';
-			}
-			if (valid) {
-				length = static_cast<uint32_t>(
-				        std::strtoul(length_text.c_str(),&end,16));
-				valid = end && *end == '\0' && length > 0 &&
-				        length <= 16u * 1024u * 1024u;
-			}
-		} else {
-			valid = false;
+			length = static_cast<uint32_t>(std::strtoul(length_text.c_str(),&end,16));
+			valid = end && *end == '\0' && length > 0 &&
+			        length <= 16u * 1024u * 1024u;
 		}
 
 		std::string trailing;
 		if (original_stream >> trailing) valid = false;
 		if (!valid) {
 			DEBUG_ShowMsg("DEBUG: ADDMEMDUMP syntax: delay-ms "
-			              "segment:offset hex-length filename.\n");
+			              "segment:offset|PHYS:address hex-length filename.\n");
 		} else {
 			auto *request = new ScheduledMemoryDump;
-			request->address = GetAddress(static_cast<uint16_t>(segment),offset);
+			request->address = dump_address;
 			request->length = length;
 			request->filename = filename;
 			PIC_AddEvent(&delayed_memory_dump,delay,
@@ -3594,7 +3568,7 @@ bool ParseCommand(char* str) {
 		                >> address_text >> length_text >> filename;
 		bool valid = !original_stream.fail() && !(original_stream >> trailing);
 		uint64_t delay = 0, duration = 0, linear_ip = 0, register_value = 0;
-		uint64_t max_hits = 0, segment = 0, offset = 0, length = 0;
+		uint64_t max_hits = 0, snapshot_address = 0, length = 0;
 		auto parse_number = [](const std::string &text, const int base,
 		                       uint64_t &value) {
 			if (text.empty() || text.front() == '-' || text.front() == '+') return false;
@@ -3618,23 +3592,9 @@ bool ParseCommand(char* str) {
 		                  register_name == "ECX" || register_name == "EDX" ||
 		                  register_name == "ESI" || register_name == "EDI" ||
 		                  register_name == "EBP" || register_name == "ESP");
-		const auto colon = address_text.find(':');
-		if (valid && colon != std::string::npos && colon > 0 &&
-		    colon + 1 < address_text.size()) {
-			valid = parse_number(address_text.substr(0,colon),16,segment) &&
-			        parse_number(address_text.substr(colon + 1),16,offset) &&
-			        segment <= UINT16_MAX && offset <= UINT32_MAX;
-		} else {
-			valid = false;
-		}
+		valid = valid && ParseScheduledAddress(address_text,snapshot_address,true);
 		valid = valid && parse_number(length_text,16,length) && length >= 1 &&
 		        length <= 65536 && (max_hits * length <= 64u * 1024u * 1024u);
-		// Segment zero explicitly selects a linear snapshot address. Startup
-		// DEBUGBOX runs in real mode, where GetAddress would otherwise wrap a
-		// requested physical address above64KiB to a16-bit segment offset.
-		const auto snapshot_address = valid
-		        ? (segment == 0 ? offset : GetAddress(static_cast<uint16_t>(segment),
-		                                              static_cast<uint32_t>(offset))) : 0;
 		valid = valid && uint64_t(snapshot_address) + length <= (uint64_t(UINT32_MAX) + 1u);
 #if !C_HEAVY_DEBUG
 		DEBUG_ShowMsg("DEBUG: ADDEXECDUMP requires a heavy-debug build.\n");
