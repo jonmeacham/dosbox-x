@@ -401,7 +401,37 @@ unsigned long PIT_TICK_RATE = PIT_TICK_RATE_IBM;
 
 pic_tickindex_t VGA_PITSync_delay(void);
 
+// Optional diagnostic only: scheduled timer epoch and actual service epoch.
+// Preserve both clocks; I/O cycle accounting can delay event service.
+namespace {
+struct NativePITTrace {
+    FILE *file = nullptr;
+    unsigned long long ordinal = 0;
+    NativePITTrace() {
+        const char *path = getenv("DOSBOX_X_NATIVE_PIT_TRACE");
+        if(path && *path) {
+            file = fopen(path, "w");
+            if(file) fputs("ordinal,pic_ms,event_ms,period_ms,counter,mode,cycle_max\n", file);
+        }
+    }
+    ~NativePITTrace() { if(file) fclose(file); }
+    void record() {
+        if(!file) return;
+        if(ordinal >= 200000) {
+            fputs("CAP\n",file); fclose(file); file = nullptr; return;
+        }
+        fprintf(file,"%llu,%.17g,%.17g,%.17g,%u,%u,%lld\n",ordinal++,
+            (double)PIC_FullIndex(), (double)PIC_GetCurrentEventTime(),
+            (double)pit[0].delay, (unsigned)pit[0].cntr,
+            (unsigned)pit[0].mode, (long long)CPU_CycleMax);
+        fflush(file);
+    }
+};
+NativePITTrace &nativePITTrace() { static NativePITTrace trace; return trace; }
+}
+
 static void PIT0_Event(Bitu /*val*/) {
+    nativePITTrace().record();
 	/* HACK: Despite edge trigger, force IRQ */
 	PIC_DeActivateIRQ(0);
 	PIC_ActivateIRQ(0);
