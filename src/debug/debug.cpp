@@ -2406,7 +2406,8 @@ static void capture_scheduled_exec_dumps() {
 	     it != scheduled_exec_dumps.end();) {
 		auto &request = *it;
 		if (!request.armed || request.linear_ip != linear_ip ||
-		    request.register_value != scheduled_exec_dump_register_value(request)) {
+		    (request.register_name != "ANY" &&
+             request.register_value != scheduled_exec_dump_register_value(request))) {
 			++it;
 			continue;
 		}
@@ -3644,7 +3645,8 @@ bool ParseCommand(char* str) {
 		valid = valid && (register_name == "EAX" || register_name == "EBX" ||
 		                  register_name == "ECX" || register_name == "EDX" ||
 		                  register_name == "ESI" || register_name == "EDI" ||
-		                  register_name == "EBP" || register_name == "ESP");
+		                  register_name == "EBP" || register_name == "ESP" ||
+                          (register_name == "ANY" && register_value == 0));
 		valid = valid && ParseScheduledAddress(address_text,snapshot_address,true);
 		valid = valid && parse_number(length_text,16,length) && length >= 1 &&
 		        length <= 65536 && (max_hits * length <= 64u * 1024u * 1024u);
@@ -3659,7 +3661,7 @@ bool ParseCommand(char* str) {
 		}
 		if (!valid) {
 			DEBUG_ShowMsg("DEBUG: ADDEXECDUMP syntax: delay-ms duration-ms "
-			              "linear-ip register hex-value max-hits segment:offset "
+			              "linear-ip register(EAX..ESP/ANY) hex-value(0-for-ANY) max-hits segment:offset "
 			              "hex-length filename.\n");
 			return true;
 		}
