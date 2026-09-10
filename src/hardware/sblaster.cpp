@@ -1903,6 +1903,36 @@ void SB_INFO::CTMIXER_Reset(void) {
  */
 
 void SB_INFO::DSP_DoCommand(void) {
+	// Optional guest-command witness, before any device mutation or FillUp.
+	// Hex payload contains only the completed command's actual input bytes.
+	struct CommandTrace {
+		FILE *file=nullptr;
+		size_t bytes=0;
+		unsigned long long ordinal=0;
+		CommandTrace() {
+			const char *path=getenv("DOSBOX_X_NATIVE_SB_COMMANDS");
+			if(path && *path) {
+				file=fopen(path,"w");
+				if(file)bytes=fprintf(file,"ordinal,card,pic_ms,command,payload\n");
+			}
+		}
+		~CommandTrace(){if(file)fclose(file);}
+		void record(size_t card,unsigned command,const uint8_t *data,size_t count) {
+			if(!file)return;
+			if(count>DSP_BUFSIZE || bytes+2048>64u*1024u*1024u) {
+				fputs("CAP\n",file);fclose(file);file=nullptr;return;
+			}
+			std::ostringstream payload;
+			payload<<std::hex<<std::setfill('0');
+			for(size_t i=0;i<count;++i)payload<<std::setw(2)<<unsigned(data[i]);
+			const int n=fprintf(file,"%llu,%zu,%.17g,%u,%s\n",ordinal++,card,
+				(double)PIC_FullIndex(),command,payload.str().c_str());
+			if(n<0){fclose(file);file=nullptr;return;}
+			bytes+=size_t(n);fflush(file);
+		}
+	};
+	static CommandTrace commandTrace;
+	commandTrace.record(card_index,dsp.cmd,dsp.in.data,dsp.in.pos);
 	LOG(LOG_SB,LOG_NORMAL)("DSP Command: 0x%02X", dsp.cmd);
 	if (ess_type != ESS_NONE && dsp.cmd >= 0xA0 && dsp.cmd <= 0xCF) {
 		// ESS overlap with SB16 commands. Handle it here, not mucking up the switch statement.
