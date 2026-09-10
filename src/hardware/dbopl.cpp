@@ -39,6 +39,8 @@
 #include <string.h>
 #include "dosbox.h"
 #include "dbopl.h"
+#include "pic.h"
+#include <stdio.h>
 
 
 #ifndef PI
@@ -50,6 +52,52 @@ extern bool adlib_pcm_boost;
 void adlib_boost32(int32_t *buf,unsigned int c,unsigned int ch);
 
 namespace DBOPL {
+
+// Opt-in focus-free certification trace. Little-endian DXOPL001 records:
+// kind,a,b,gainL,gainR,boost (six u32), PIC ms (f64), generated frames (u64).
+// Generate records carry a*b signed int32 samples before boost/mixer scaling.
+// Bounded to 64 MiB; disabled unless the explicit output path is supplied.
+namespace {
+struct NativeOPLTrace {
+    FILE *file = nullptr;
+    uint64_t frames = 0, bytes = 8;
+    NativeOPLTrace() {
+        const char *path = getenv("DOSBOX_X_NATIVE_OPL_TRACE");
+        if(path && *path) {
+            file = fopen(path,"wb");
+            if(file) fwrite("DXOPL001",1,8,file);
+        }
+    }
+    ~NativeOPLTrace() { if(file) fclose(file); }
+    void word(uint64_t value, unsigned width) {
+        unsigned char data[8];
+        for(unsigned i=0;i<width;++i) data[i]=(unsigned char)(value>>(8*i));
+        fwrite(data,1,width,file);
+    }
+    void record(uint32_t kind,uint32_t a,uint32_t b,MixerChannel *channel=nullptr,const int32_t *pcm=nullptr) {
+        if(!file) return;
+        uint64_t length=40+(pcm?uint64_t(a)*b*4:0);
+        if(bytes+length+40>64u*1024u*1024u) { kind=4;a=1;b=0;pcm=nullptr;length=40; }
+        word(kind,4);word(a,4);word(b,4);
+        word(channel?(uint32_t)channel->volmul[0]:0,4);
+        word(channel?(uint32_t)channel->volmul[1]:0,4);
+        word(adlib_pcm_boost?1:0,4);
+        double time=PIC_FullIndex(); uint64_t bits; memcpy(&bits,&time,8);
+        word(bits,8);word(frames,8);
+        if(pcm) {
+            unsigned char data[4096];
+            for(unsigned i=0;i<a*b;++i) for(unsigned j=0;j<4;++j)
+                data[i*4+j]=(unsigned char)((uint32_t)pcm[i]>>(j*8));
+            fwrite(data,1,a*b*4,file);
+        }
+        bytes+=length;
+        if(kind==2) frames+=a;
+        fflush(file);
+        if(kind==4) { fclose(file);file=nullptr; }
+    }
+};
+NativeOPLTrace &nativeTrace() { static NativeOPLTrace trace;return trace; }
+}
 
 #define OPLRATE		((double)(14318180.0 / 288.0))
 #define TREMOLO_TABLE 52
@@ -1511,6 +1559,7 @@ uint32_t Handler::WriteAddr( uint32_t port, uint8_t val ) {
 
 }
 void Handler::WriteReg( uint32_t addr, uint8_t val ) {
+	nativeTrace().record(1,addr,val);
 	chip.WriteReg( addr, val );
 }
 
@@ -1520,16 +1569,19 @@ void Handler::Generate( MixerChannel* chan, Bitu samples ) {
 		samples = 512;
 	if ( !chip.opl3Active ) {
 		chip.GenerateBlock2( samples, buffer );
+		nativeTrace().record(2,(uint32_t)samples,1,chan,buffer);
 		if (adlib_pcm_boost) adlib_boost32(buffer,samples,1/*mono*/);
 		chan->AddSamples_m32( samples, buffer );
 	} else {
 		chip.GenerateBlock3( samples, buffer );
+		nativeTrace().record(2,(uint32_t)samples,2,chan,buffer);
 		if (adlib_pcm_boost) adlib_boost32(buffer,samples,2/*stereo*/);
 		chan->AddSamples_s32( samples, buffer );
 	}
 }
 
 void Handler::Init( Bitu rate ) {
+	nativeTrace().record(3,(uint32_t)rate,0);
 	InitTables();
 	chip.Setup( (uint32_t)rate );
 }
