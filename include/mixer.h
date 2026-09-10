@@ -93,6 +93,8 @@ public:
 	void AddSamples_s32_nonnative(Bitu len, const int32_t * data);
 
 	void FillUp(void);
+	// Same fill operation with optional causal metadata for native event tracing.
+	void FillUpWithReason(unsigned reason, int64_t value);
 	void Enable(bool _yesno);
 	void SaveState( std::ostream& stream );
 	void LoadState( std::istream& stream );

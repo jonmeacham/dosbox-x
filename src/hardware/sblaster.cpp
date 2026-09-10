@@ -1102,9 +1102,18 @@ void SB_INFO::CheckDMAEnd(void) {
 	}
 }
 
+// Kind-1 native audio events retain source SB and carry this reason in a,
+// with the requested mode/frequency, mixer index, DSP command, port or DMA
+// event in b. Metadata is diagnostic only and does not alter fill scheduling.
+enum SBFillReason : unsigned {
+    SB_FILL_MODE=1, SB_FILL_TRANSFER=2, SB_FILL_RATE=3,
+    SB_FILL_VOLUME=4, SB_FILL_COMMAND=5, SB_FILL_IRQ_ACK=6,
+    SB_FILL_DMA_COUNTER=7
+};
+
 void SB_INFO::DSP_ChangeMode(DSP_MODES new_mode) {
 	if (mode == new_mode) return;
-	else chan->FillUp();
+	else chan->FillUpWithReason(SB_FILL_MODE,new_mode);
 	mode=new_mode;
 }
 
@@ -1172,7 +1181,7 @@ void SB_INFO::DSP_DoDMATransfer(DMA_MODES new_mode,Bitu freq,bool stereo,bool do
 	if (dma_dac_mode && goldplay_stereo && (stereo || mixer.sbpro_stereo) && single_sample_dma)
 		dma_dac_srcrate = freq;
 
-	chan->FillUp();
+	chan->FillUpWithReason(SB_FILL_TRANSFER,freq);
 
 	if (!dontInitLeft)
 		dma.left=dma.total;
@@ -1501,7 +1510,7 @@ void SB_INFO::DSP_DoReset(uint8_t val) {
 
 void SB_INFO::DSP_ChangeRate(Bitu new_freq) {
 	if (freq!=new_freq && dma.mode!=DSP_DMA_NONE) {
-		chan->FillUp();
+		chan->FillUpWithReason(SB_FILL_RATE,new_freq);
 		chan->SetFreq(new_freq / (mixer.stereo ? 2 : 1));
 		dma.rate=(new_freq*dma.mul) >> SB_SH;
 		dma.min=(dma.rate*3)/1000;
@@ -1861,7 +1870,7 @@ float SB_INFO::calc_vol(uint8_t amount) {
 void SB_INFO::CTMIXER_UpdateVolumes(void) {
 	if (!mixer.enabled) return;
 
-	chan->FillUp();
+	chan->FillUpWithReason(SB_FILL_VOLUME,mixer.index);
 
 	MixerChannel * chan;
 	float m0 = calc_vol(mixer.master[0]);
@@ -2296,7 +2305,7 @@ is responsible for some failures such as [https://github.com/joncampbell123/dosb
 		case 0xd5:  /* Halt 16-bit DMA */
 			DSP_SB16_ONLY;
 		case 0xd0:  /* Halt 8-bit DMA */
-			chan->FillUp();
+			chan->FillUpWithReason(SB_FILL_COMMAND,dsp.cmd);
 			//      DSP_ChangeMode(MODE_NONE);
 			//      Games sometimes already program a new dma before stopping, gives noise
 			if (mode==MODE_NONE) {
@@ -2307,11 +2316,11 @@ is responsible for some failures such as [https://github.com/joncampbell123/dosb
 			PIC_RemoveEvents(DMA_DAC_Event);
 			break;
 		case 0xd1:  /* Enable Speaker */
-			chan->FillUp();
+			chan->FillUpWithReason(SB_FILL_COMMAND,dsp.cmd);
 			DSP_SetSpeaker(true);
 			break;
 		case 0xd3:  /* Disable Speaker */
-			chan->FillUp();
+			chan->FillUpWithReason(SB_FILL_COMMAND,dsp.cmd);
 			DSP_SetSpeaker(false);
 
 			/* There are demoscene productions that reinitialize sound between parts.
@@ -2341,7 +2350,7 @@ is responsible for some failures such as [https://github.com/joncampbell123/dosb
 		case 0xd6:  /* Continue DMA 16-bit */
 			DSP_SB16_ONLY;
 		case 0xd4:  /* Continue DMA 8-bit*/
-			chan->FillUp();
+			chan->FillUpWithReason(SB_FILL_COMMAND,dsp.cmd);
 			if (mode==MODE_DMA_PAUSE) {
 				mode=MODE_DMA_MASKED;
 				if (dma.chan!=NULL) dma.chan->Register_Callback(DSP_DMA_CallBack);
@@ -2350,7 +2359,7 @@ is responsible for some failures such as [https://github.com/joncampbell123/dosb
 		case 0x47:  /* Continue Autoinitialize 16-bit */
 		case 0x45:  /* Continue Autoinitialize 8-bit */
 			DSP_SB16_ONLY;
-			chan->FillUp();
+			chan->FillUpWithReason(SB_FILL_COMMAND,dsp.cmd);
 			dma.autoinit=true; // No. This DSP command does not resume DMA playback
 			break;
 		case 0xd9:  /* Exit Autoinitialize 16-bit */
@@ -2359,7 +2368,7 @@ is responsible for some failures such as [https://github.com/joncampbell123/dosb
 			DSP_SB2_ABOVE;
 			/* Set mode to single transfer so it ends with current block */
 			dma.autoinit=false;      //Should stop itself
-			chan->FillUp();
+			chan->FillUpWithReason(SB_FILL_COMMAND,dsp.cmd);
 			break;
 		case 0xe0:  /* DSP Identification - SB2.0+ */
 			DSP_FlushData();
@@ -3163,7 +3172,7 @@ Bitu SB_INFO::read_sb(Bitu port,Bitu /*iolen*/) {
 			}
 
 			if (mode == MODE_DMA_REQUIRE_IRQ_ACK) {
-				chan->FillUp();
+				chan->FillUpWithReason(SB_FILL_IRQ_ACK,port);
 				mode = MODE_DMA;
 			}
 
@@ -3183,7 +3192,7 @@ Bitu SB_INFO::read_sb(Bitu port,Bitu /*iolen*/) {
 				}
 
 				if (mode == MODE_DMA_REQUIRE_IRQ_ACK) {
-					chan->FillUp();
+					chan->FillUpWithReason(SB_FILL_IRQ_ACK,port);
 					mode = MODE_DMA;
 				}
 			}
@@ -3637,7 +3646,7 @@ static void DSP_DMA_CallBack(DmaChannel * chan, DMAEvent event) {
 	assert(ci < MAX_CARDS);
 	if (chan!=sb[ci].dma.chan || event==DMA_REACHED_TC) return;
 	else if (event==DMA_READ_COUNTER) {
-		sb[ci].chan->FillUp();
+		sb[ci].chan->FillUpWithReason(SB_FILL_DMA_COUNTER,event);
 	}
 	else if (event==DMA_MASKED) {
 		if (sb[ci].mode==MODE_DMA) {

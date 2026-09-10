@@ -298,7 +298,7 @@ struct NativeMixerTrace {
 NativeMixerTrace &nativeMixerTrace() { static NativeMixerTrace trace;return trace; }
 }
 
-static void MIXER_FillUp(const char *source);
+static void MIXER_FillUp(const char *source, unsigned reason=0, int64_t value=0);
 
 void MixerChannel::Enable(bool _yesno) {
     if (_yesno==enabled) return;
@@ -810,14 +810,14 @@ static void MIXER_MixData(Bitu fracs/*render up to*/) {
     mixer_sample_counter += mixer.samples_rendered_ms.w - prev_rendered;
 }
 
-static void MIXER_FillUp(const char *source) {
+static void MIXER_FillUp(const char *source, unsigned reason, int64_t value) {
     NativeMixerContext context(source);
 #ifdef C_SDL2
     SDL_LockAudioDevice(SDL2_AudioDevice);
 #else
     SDL_LockAudio();
 #endif
-    MIXER_NativeAudioEvent(1,source);
+    MIXER_NativeAudioEvent(1,source,reason,value);
     float index = PIC_TickIndex();
     if (index < 0) index = 0;
     MIXER_MixData((Bitu)((double)index * ((Bitu)mixer.samples_this_ms.w * mixer.samples_this_ms.fd)));
@@ -830,6 +830,10 @@ static void MIXER_FillUp(const char *source) {
 
 void MixerChannel::FillUp(void) {
     MIXER_FillUp(name);
+}
+
+void MixerChannel::FillUpWithReason(unsigned reason, int64_t value) {
+    MIXER_FillUp(name,reason,value);
 }
 
 void MIXER_MixSingle(Bitu /*val*/) {
