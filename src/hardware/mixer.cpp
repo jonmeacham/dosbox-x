@@ -272,8 +272,8 @@ struct NativeMixerTrace {
     FILE *file = nullptr;
     size_t bytes = 0;
     unsigned long long ordinal = 0;
-    NativeMixerTrace() {
-        const char *path=getenv("DOSBOX_X_NATIVE_MIXER_TRACE");
+    explicit NativeMixerTrace(const char *environment="DOSBOX_X_NATIVE_MIXER_TRACE") {
+        const char *path=getenv(environment);
         if(path && *path) {
             file=fopen(path,"w");
             if(file) bytes=fprintf(file,"ordinal,phase,source,pic_ticks,pic_ms,whole,frac,request,ms_whole,ms_num,ms_den,buffer_out,loaded,freq_n,freq_d,freq_f,freq_fslew\n");
@@ -296,6 +296,7 @@ struct NativeMixerTrace {
     }
 };
 NativeMixerTrace &nativeMixerTrace() { static NativeMixerTrace trace;return trace; }
+NativeMixerTrace &nativeSBMixerTrace() { static NativeMixerTrace trace("DOSBOX_X_NATIVE_SB_MIXER_TRACE");return trace; }
 }
 
 static void MIXER_FillUp(const char *source, unsigned reason=0, int64_t value=0);
@@ -451,10 +452,11 @@ void MixerChannel::Mix(Bitu whole,Bitu frac) {
         todo += (uint64_t)freq_d - (uint64_t)1;
         todo /= (uint64_t)freq_d;
         if (!current_loaded) todo++;
-        const bool traceOPL = !strcmp(name,"FM");
-        if(traceOPL) nativeMixerTrace().record("before",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
+        NativeMixerTrace *trace = !strcmp(name,"FM") ? &nativeMixerTrace() :
+                                  !strcmp(name,"SB") ? &nativeSBMixerTrace() : nullptr;
+        if(trace) trace->record("before",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
         handler(todo);
-        if(traceOPL) nativeMixerTrace().record("after",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
+        if(trace) trace->record("after",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
 
         if (--patience == 0) break;
     }
