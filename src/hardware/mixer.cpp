@@ -230,7 +230,45 @@ void MixerChannel::SetScale(float _left, float _right) {
 	}
 }
 
-static void MIXER_FillUp(void);
+// Opt-in source-request evidence. No guest counters or mixer state are changed.
+namespace {
+const char *nativeMixerSource = "unknown";
+struct NativeMixerContext {
+    const char *previous;
+    explicit NativeMixerContext(const char *source): previous(nativeMixerSource) { nativeMixerSource=source; }
+    ~NativeMixerContext() { nativeMixerSource=previous; }
+};
+struct NativeMixerTrace {
+    FILE *file = nullptr;
+    size_t bytes = 0;
+    unsigned long long ordinal = 0;
+    NativeMixerTrace() {
+        const char *path=getenv("DOSBOX_X_NATIVE_MIXER_TRACE");
+        if(path && *path) {
+            file=fopen(path,"w");
+            if(file) bytes=fprintf(file,"ordinal,phase,source,pic_ticks,pic_ms,whole,frac,request,ms_whole,ms_num,ms_den,buffer_out,loaded,freq_n,freq_d,freq_f,freq_fslew\n");
+        }
+    }
+    ~NativeMixerTrace() { if(file) fclose(file); }
+    void record(const char *phase, Bitu whole, Bitu frac, Bitu request,
+                Bitu bufferOut, bool loaded, Bitu n, Bitu d, Bitu f, Bitu slew) {
+        if(!file) return;
+        if(bytes+512>64u*1024u*1024u) { fputs("CAP\n",file);fclose(file);file=nullptr;return; }
+        int count=fprintf(file,"%llu,%s,%s,%llu,%.17g,%llu,%llu,%llu,%u,%u,%u,%llu,%u,%llu,%llu,%llu,%llu\n",
+            ordinal++,phase,nativeMixerSource,(unsigned long long)PIC_Ticks,(double)PIC_FullIndex(),
+            (unsigned long long)whole,(unsigned long long)frac,(unsigned long long)request,
+            mixer.samples_this_ms.w,mixer.samples_this_ms.fn,mixer.samples_this_ms.fd,
+            (unsigned long long)bufferOut,loaded?1u:0u,(unsigned long long)n,(unsigned long long)d,
+            (unsigned long long)f,(unsigned long long)slew);
+        if(count<0) { fclose(file);file=nullptr;return; }
+        bytes+=(size_t)count;
+        fflush(file);
+    }
+};
+NativeMixerTrace &nativeMixerTrace() { static NativeMixerTrace trace;return trace; }
+}
+
+static void MIXER_FillUp(const char *source);
 
 void MixerChannel::Enable(bool _yesno) {
     if (_yesno==enabled) return;
@@ -382,7 +420,10 @@ void MixerChannel::Mix(Bitu whole,Bitu frac) {
         todo += (uint64_t)freq_d - (uint64_t)1;
         todo /= (uint64_t)freq_d;
         if (!current_loaded) todo++;
+        const bool traceOPL = !strcmp(name,"FM");
+        if(traceOPL) nativeMixerTrace().record("before",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
         handler(todo);
+        if(traceOPL) nativeMixerTrace().record("after",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
 
         if (--patience == 0) break;
     }
@@ -738,7 +779,8 @@ static void MIXER_MixData(Bitu fracs/*render up to*/) {
     mixer_sample_counter += mixer.samples_rendered_ms.w - prev_rendered;
 }
 
-static void MIXER_FillUp(void) {
+static void MIXER_FillUp(const char *source) {
+    NativeMixerContext context(source);
 #ifdef C_SDL2
     SDL_LockAudioDevice(SDL2_AudioDevice);
 #else
@@ -755,15 +797,16 @@ static void MIXER_FillUp(void) {
 }
 
 void MixerChannel::FillUp(void) {
-    MIXER_FillUp();
+    MIXER_FillUp(name);
 }
 
 void MIXER_MixSingle(Bitu /*val*/) {
-    MIXER_FillUp();
+    MIXER_FillUp("sample");
     PIC_AddEvent(MIXER_MixSingle,1000.0 / mixer.freq);
 }
 
 static void MIXER_Mix(void) {
+    NativeMixerContext context("tick");
     Bitu thr;
 
 #ifdef C_SDL2
@@ -803,7 +846,7 @@ static void MIXER_Mix(void) {
 #else
     SDL_UnlockAudio();
 #endif
-    MIXER_FillUp();
+    MIXER_FillUp("posttick");
 }
 
 static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
