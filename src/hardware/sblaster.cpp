@@ -577,6 +577,7 @@ struct SB_INFO {
 	void CTMIXER_Write(uint8_t val);
 	uint8_t ESS_DoRead(uint8_t reg);
 	void SB_RaiseIRQ(SB_IRQS type);
+	void TraceNativeIRQ(const char *event);
 	float calc_vol(uint8_t amount);
 	void DSP_AddData(uint8_t val);
 	void DSP_DoReset(uint8_t val);
@@ -789,6 +790,37 @@ void SB_INFO::DSP_FlushData(void) {
  *      to remap IRQ 2 -> IRQ 9 for us *if* emulating AT hardware.
  *
  *      --Jonathan C. */
+// Optional ordered witness of DMA completion and guest IRQ acknowledgement.
+// Read-only snapshots: DMA controller position is distinct from guest half state.
+void SB_INFO::TraceNativeIRQ(const char *event) {
+    struct Trace {
+        FILE *file=nullptr;
+        size_t bytes=0;
+        unsigned long long ordinal=0;
+        Trace() {
+            const char *path=getenv("DOSBOX_X_NATIVE_SB_IRQ_TRACE");
+            if(path && *path) {
+                file=fopen(path,"w");
+                if(file)bytes=fprintf(file,"ordinal,event,card,pic_ms,pending8,pending16,mode,dma_mode,left,total,autoinit,address,count\n");
+            }
+        }
+        ~Trace(){if(file)fclose(file);}
+    };
+    static Trace trace;
+    if(!trace.file)return;
+    if(trace.bytes+1024>64u*1024u*1024u) {
+        fputs("CAP\n",trace.file);fclose(trace.file);trace.file=nullptr;return;
+    }
+    const int n=fprintf(trace.file,"%llu,%s,%zu,%.17g,%u,%u,%u,%u,%llu,%llu,%u,%llu,%llu\n",
+        trace.ordinal++,event,size_t(card_index),double(PIC_FullIndex()),
+        unsigned(irq.pending_8bit),unsigned(irq.pending_16bit),unsigned(mode),unsigned(dma.mode),
+        (unsigned long long)dma.left,(unsigned long long)dma.total,unsigned(dma.autoinit),
+        dma.chan ? (unsigned long long)dma.chan->curraddr : 0,
+        dma.chan ? (unsigned long long)dma.chan->currcnt : 0);
+    if(n<0){fclose(trace.file);trace.file=nullptr;return;}
+    trace.bytes+=size_t(n);fflush(trace.file);
+}
+
 void SB_INFO::SB_RaiseIRQ(SB_IRQS type) {
 	LOG(LOG_SB,LOG_NORMAL)("Raising IRQ");
 
@@ -804,6 +836,7 @@ void SB_INFO::SB_RaiseIRQ(SB_IRQS type) {
 				return;
 			}
 			irq.pending_8bit=true;
+			TraceNativeIRQ("raise8");
 			PIC_ActivateIRQ(hw.irq);
 			break;
 		case SB_IRQ_16:
@@ -812,6 +845,7 @@ void SB_INFO::SB_RaiseIRQ(SB_IRQS type) {
 				return;
 			}
 			irq.pending_16bit=true;
+			TraceNativeIRQ("raise16");
 			PIC_ActivateIRQ(hw.irq);
 			break;
 		default:
@@ -841,6 +875,7 @@ void SB_INFO::sb_update_recording_source_settings() {
 }
 
 void SB_INFO::SB_OnEndOfDMA(void) {
+	TraceNativeIRQ("dma_end");
 	bool was_irq=false;
 
 	PIC_RemoveEvents(END_DMA_Event);
@@ -3197,6 +3232,7 @@ Bitu SB_INFO::read_sb(Bitu port,Bitu /*iolen*/) {
 		case DSP_READ_STATUS:
 			//TODO See for high speed dma :)
 			if (irq.pending_8bit)  {
+				TraceNativeIRQ("ack8");
 				irq.pending_8bit=false;
 				PIC_DeActivateIRQ(hw.irq);
 			}
@@ -3217,6 +3253,7 @@ Bitu SB_INFO::read_sb(Bitu port,Bitu /*iolen*/) {
 		case DSP_ACK_16BIT:
 			if (ess_type == ESS_NONE && type == SBT_16) {
 				if (irq.pending_16bit)  {
+					TraceNativeIRQ("ack16");
 					irq.pending_16bit=false;
 					PIC_DeActivateIRQ(hw.irq);
 				}
