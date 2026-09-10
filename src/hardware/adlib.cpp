@@ -1435,7 +1435,43 @@ static void OPL_CallBack(Bitu len) {
 	}
 }
 
+// Opt-in port-entry timing evidence. Logging never changes guest cycle state.
+// OPL status reads can generate partial mixer blocks, so retain every entry in
+// file order rather than inferring spacing from register writes alone.
+extern unsigned int last_callback;
+namespace {
+struct NativeOPLIOTrace {
+    FILE *file = nullptr;
+    size_t bytes = 0;
+    unsigned long long ordinal = 0;
+    NativeOPLIOTrace() {
+        const char *path = getenv("DOSBOX_X_NATIVE_OPL_IO_TRACE");
+        if(path && *path) {
+            file = fopen(path, "w");
+            if(file) bytes = fprintf(file, "ordinal,kind,port,value,width,pic_ms,cycles,cycle_max,io_removed,callback\n");
+        }
+    }
+    ~NativeOPLIOTrace() { if(file) fclose(file); }
+    void record(char kind, Bitu port, Bitu value, Bitu width) {
+        if(!file) return;
+        if(bytes + 512 > 64u * 1024u * 1024u) {
+            fputs("CAP\n", file);
+            fclose(file); file = nullptr; return;
+        }
+        const int count = fprintf(file, "%llu,%c,%u,%u,%u,%.17g,%lld,%lld,%lld,%u\n",
+            ordinal++, kind, (unsigned)port, (unsigned)value, (unsigned)width,
+            (double)PIC_FullIndex(), (long long)CPU_Cycles,
+            (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved, last_callback);
+        if(count < 0) { fclose(file); file = nullptr; return; }
+        bytes += (size_t)count;
+        fflush(file);
+    }
+};
+NativeOPLIOTrace &nativeOPLIOTrace() { static NativeOPLIOTrace trace; return trace; }
+}
+
 static Bitu OPL_Read(Bitu port,Bitu iolen) {
+    nativeOPLIOTrace().record('R', port, 0, iolen);
 	if (IS_PC98_ARCH) {
 		if (port == 0xC8D2 && iolen == 1 && module->PortRead(port, iolen) == 0xFF && module->PortRead(port/0x100, iolen) == 0) return 0xFF; // fix for First Queen
 		port >>= 8u; // C8D2h -> C8h, C9D2h -> C9h, OPL emulation looks only at bit 0.
@@ -1450,6 +1486,7 @@ static Bitu OPL_Read(Bitu port,Bitu iolen) {
 pic_tickindex_t last_opl_write = 0;
 
 void OPL_Write(Bitu port,Bitu val,Bitu iolen) {
+    nativeOPLIOTrace().record('W', port, val, iolen);
 	if (IS_PC98_ARCH) port >>= 8u; // C8D2h -> C8h, C9D2h -> C9h, OPL emulation looks only at bit 0.
 
 	// if writing the data port, assume a change in OPL state that should be reflected immediately.
