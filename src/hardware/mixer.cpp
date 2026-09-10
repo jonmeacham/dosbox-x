@@ -193,6 +193,7 @@ void MIXER_DelChannel(MixerChannel* delchan) {
     MixerChannel * * where=&mixer.channels;
     while (chan) {
         if (chan==delchan) {
+            if(!strcmp(chan->name,"FM"))MIXER_NativeAudioEvent(6,"FM");
             *where=chan->next;
             delete delchan;
             return;
@@ -202,9 +203,38 @@ void MIXER_DelChannel(MixerChannel* delchan) {
     }
 }
 
+namespace {
+struct NativeAudioEvents {
+    FILE *file=nullptr;
+    size_t bytes=0;
+    unsigned long long ordinal=0;
+    NativeAudioEvents() {
+        const char *path=getenv("DOSBOX_X_NATIVE_AUDIO_EVENTS");
+        if(path && *path) {
+            file=fopen(path,"w");
+            if(file)bytes=fprintf(file,"ordinal,kind,source,pic_ticks,pic_index,a,b\n");
+        }
+    }
+    ~NativeAudioEvents(){if(file)fclose(file);}
+    void record(unsigned kind,const char *source,int64_t a,int64_t b) {
+        if(!file)return;
+        if(bytes+512>64u*1024u*1024u){fputs("CAP\n",file);fclose(file);file=nullptr;return;}
+        const double index=CPU_CycleMax>0 ? (double)PIC_TickIndex() : 0.0;
+        const int count=fprintf(file,"%llu,%u,%s,%llu,%.17g,%lld,%lld\n",ordinal++,kind,source,
+            (unsigned long long)PIC_Ticks,index,(long long)a,(long long)b);
+        if(count<0){fclose(file);file=nullptr;return;}
+        bytes+=(size_t)count;fflush(file);
+    }
+};
+}
+void MIXER_NativeAudioEvent(unsigned kind,const char *source,int64_t a,int64_t b) {
+    static NativeAudioEvents trace;trace.record(kind,source,a,b);
+}
+
 void MixerChannel::UpdateVolume(void) {
     volmul[0]=(Bits)((1 << MIXER_VOLSHIFT)*scale[0]*volmain[0]);
     volmul[1]=(Bits)((1 << MIXER_VOLSHIFT)*scale[1]*volmain[1]);
+    if(!strcmp(name,"FM"))MIXER_NativeAudioEvent(5,"FM",volmul[0],volmul[1]);
 }
 
 void MixerChannel::SetVolume(float _left,float _right) {
@@ -272,6 +302,7 @@ static void MIXER_FillUp(const char *source);
 
 void MixerChannel::Enable(bool _yesno) {
     if (_yesno==enabled) return;
+    if(!strcmp(name,"FM"))MIXER_NativeAudioEvent(4,"FM",_yesno?1:0,rend_n);
     enabled=_yesno;
     if (!enabled) freq_f=0;
 }
@@ -786,6 +817,7 @@ static void MIXER_FillUp(const char *source) {
 #else
     SDL_LockAudio();
 #endif
+    MIXER_NativeAudioEvent(1,source);
     float index = PIC_TickIndex();
     if (index < 0) index = 0;
     MIXER_MixData((Bitu)((double)index * ((Bitu)mixer.samples_this_ms.w * mixer.samples_this_ms.fd)));
@@ -816,6 +848,7 @@ static void MIXER_Mix(void) {
 #endif
 
     /* render */
+    MIXER_NativeAudioEvent(2,"tick");
     assert((mixer.work_in+mixer.samples_per_ms.w) <= MIXER_BUFSIZE);
     MIXER_MixData((Bitu)mixer.samples_this_ms.w * (Bitu)mixer.samples_this_ms.fd);
     mixer.work_in += mixer.samples_this_ms.w;

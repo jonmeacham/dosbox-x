@@ -40,6 +40,7 @@
 #include "dosbox.h"
 #include "dbopl.h"
 #include "pic.h"
+#include "mixer.h"
 #include <stdio.h>
 
 
@@ -1559,6 +1560,7 @@ uint32_t Handler::WriteAddr( uint32_t port, uint8_t val ) {
 
 }
 void Handler::WriteReg( uint32_t addr, uint8_t val ) {
+	MIXER_NativeAudioEvent(3,"FM",addr,val);
 	nativeTrace().record(1,addr,val);
 	chip.WriteReg( addr, val );
 }
@@ -1581,6 +1583,7 @@ void Handler::Generate( MixerChannel* chan, Bitu samples ) {
 }
 
 void Handler::Init( Bitu rate ) {
+	MIXER_NativeAudioEvent(0,"FM",rate);
 	nativeTrace().record(3,(uint32_t)rate,0);
 	InitTables();
 	chip.Setup( (uint32_t)rate );
