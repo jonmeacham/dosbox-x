@@ -297,6 +297,7 @@ struct NativeMixerTrace {
 };
 NativeMixerTrace &nativeMixerTrace() { static NativeMixerTrace trace;return trace; }
 NativeMixerTrace &nativeSBMixerTrace() { static NativeMixerTrace trace("DOSBOX_X_NATIVE_SB_MIXER_TRACE");return trace; }
+NativeMixerTrace &nativeSBDemandTrace() { static NativeMixerTrace trace("DOSBOX_X_NATIVE_SB_DEMAND_TRACE");return trace; }
 }
 
 static void MIXER_FillUp(const char *source, unsigned reason=0, int64_t value=0);
@@ -384,6 +385,7 @@ void MixerChannel::SetFreq(Bitu _freq,Bitu _den) {
 void CAPTURE_MultiTrackAddWave(uint32_t freq, uint32_t len, int16_t * data,const char *name);
 
 void MixerChannel::EndFrame(Bitu samples) {
+    if(!strcmp(name,"SB")) nativeSBDemandTrace().record("end_frame",samples,0,0,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
     if (CaptureState & CAPTURE_MULTITRACK_WAVE) {// TODO: should be a separate call!
         int16_t convert[1024][2];
         Bitu cnv = msbuffer_o;
@@ -443,6 +445,8 @@ void MixerChannel::Mix(Bitu whole,Bitu frac) {
         return;
     }
 
+    if(!strcmp(name,"SB")) nativeSBDemandTrace().record("mix",whole,frac,rend_n,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
+
     // HACK: We iterate twice only because of the Sound Blaster emulation. No other emulation seems to need this.
     rendering_to_n = whole;
     rendering_to_d = frac;
@@ -455,8 +459,10 @@ void MixerChannel::Mix(Bitu whole,Bitu frac) {
         NativeMixerTrace *trace = !strcmp(name,"FM") ? &nativeMixerTrace() :
                                   !strcmp(name,"SB") ? &nativeSBMixerTrace() : nullptr;
         if(trace) trace->record("before",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
+        if(!strcmp(name,"SB")) nativeSBDemandTrace().record("before",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
         handler(todo);
         if(trace) trace->record("after",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
+        if(!strcmp(name,"SB")) nativeSBDemandTrace().record("after",whole,frac,todo,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
 
         if (--patience == 0) break;
     }
