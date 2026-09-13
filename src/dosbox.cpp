@@ -79,6 +79,7 @@
 #include "parport.h"
 #include "keyboard.h"
 #include "clockdomain.h"
+#include "guest_control.h"
 
 #if __APPLE__ && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
 /* FIX_ME: A workaround to avoid build error. Change version to 101300 if error occurs for Sierra (10.12) */
@@ -466,6 +467,7 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
+            GuestControl_Poll();
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();
