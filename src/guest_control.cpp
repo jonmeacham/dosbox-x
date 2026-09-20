@@ -1,8 +1,9 @@
-/* Opt-in guest input and read-only observation, polled by the normal CPU loop.
- * No debugger entry, guest memory writes, or execution-state manipulation. */
+/* Opt-in guest input and bounded parity observation, polled by the normal CPU
+ * loop. The only write is the explicit Albion shared-RNG checkpoint command. */
 #include "guest_control.h"
 #if defined(__unix__) || defined(__APPLE__)
 #include "dosbox.h"
+#include "cpu.h"
 #include "keyboard.h"
 #include "mouse.h"
 #include "pic.h"
@@ -29,14 +30,19 @@
 namespace {
 constexpr size_t MAX_LINE = 512, MAX_PENDING = 128, MAX_OUT = 65536;
 constexpr uint32_t MAX_DELAY = 600000, MAX_DUMP = 16 * 1024 * 1024;
+constexpr uint32_t ALBION_SHARED_RNG_ADDRESS = 0x2bafa4;
 struct Event {
-    enum Kind { Key, Move, Button, Dump } kind = Move;
+    enum Kind { Key, Move, Absolute, Button, Dump, Seed, CpuState } kind = Move;
     uint64_t id = 0, session = 0;
-    uint32_t delay = 0, duration = 0, address = 0, length = 0;
+    uint32_t delay = 0, duration = 0, address = 0, length = 0, seed = 0;
     KBD_KEYS key = KBD_NONE;
     int x = 0, y = 0, button = 0;
     bool pressed = false, started = false;
     std::string command, file;
+    uint32_t cpu_cs = 0, cpu_eip = 0, cpu_linear = 0;
+    uint32_t cpu_ss = 0, cpu_esp = 0;
+    std::vector<uint32_t> cpu_stack;
+    size_t keyboard_space = 0;
 };
 struct State {
     bool initialized = false, disabled = false, failed = false, discarding = false;
@@ -91,7 +97,23 @@ void record(const Event &e, const char *status, const char *reason = "")
         << ",\"pid\":" << getpid() << ",\"status\":" << quote(status)
         << ",\"guestTick\":" << PIC_FullIndex()
         << ",\"command\":" << quote(e.command)
-        << ",\"reason\":" << quote(reason) << "}\n";
+        << ",\"reason\":" << quote(reason);
+    if (e.kind == Event::CpuState && !strcmp(status, "done")) {
+        out << ",\"cpu\":{\"cs\":" << e.cpu_cs
+            << ",\"eip\":" << e.cpu_eip
+            << ",\"linear\":" << e.cpu_linear
+            << ",\"ss\":" << e.cpu_ss
+            << ",\"esp\":" << e.cpu_esp
+            << ",\"stack\":[";
+        for (size_t i = 0; i < e.cpu_stack.size(); ++i) {
+            if (i) out << ',';
+            out << e.cpu_stack[i];
+        }
+        out << "]}";
+    }
+    if (e.kind == Event::Key && (!strcmp(status, "pressed") || !strcmp(status, "done")))
+        out << ",\"keyboardBufferSpace\":" << e.keyboard_space;
+    out << "}\n";
     const auto line = out.str();
     if (s.log < 0 || !write_all(s.log, line.data(), line.size())) {
         s.failed = true;
@@ -111,8 +133,16 @@ bool number(const std::string &text, long long &value, int base = 10)
     return end != text.c_str() && *end == 0 && errno != ERANGE;
 }
 static bool keyname(const std::string &n,KBD_KEYS &k) {
- static const std::map<std::string,KBD_KEYS> m={{"escape",KBD_esc},{"esc",KBD_esc},{"enter",KBD_enter},{"space",KBD_space},{"tab",KBD_tab},{"backspace",KBD_backspace},{"up",KBD_up},{"down",KBD_down},{"left",KBD_left},{"right",KBD_right},{"insert",KBD_insert},{"delete",KBD_delete},{"home",KBD_home},{"end",KBD_end},{"pageup",KBD_pageup},{"pagedown",KBD_pagedown}};
+ static const std::map<std::string,KBD_KEYS> m={{"escape",KBD_esc},{"esc",KBD_esc},{"enter",KBD_enter},{"return",KBD_enter},{"space",KBD_space},{"tab",KBD_tab},{"backspace",KBD_backspace},{"up",KBD_up},{"down",KBD_down},{"left",KBD_left},{"right",KBD_right},{"insert",KBD_insert},{"delete",KBD_delete},{"home",KBD_home},{"end",KBD_end},{"pageup",KBD_pageup},{"pagedown",KBD_pagedown},{"lctrl",KBD_leftctrl},{"control",KBD_leftctrl},{"lalt",KBD_leftalt},{"option",KBD_leftalt},{"lshift",KBD_leftshift},{"shift",KBD_leftshift},{"lcmd",KBD_lwindows},{"command",KBD_lwindows}};
  auto it=m.find(n); if(it!=m.end()){k=it->second;return true;} if(n.size()==1){ char c=n[0]; if(c>='a'&&c<='z'){ static const KBD_KEYS letters[]={KBD_a,KBD_b,KBD_c,KBD_d,KBD_e,KBD_f,KBD_g,KBD_h,KBD_i,KBD_j,KBD_k,KBD_l,KBD_m,KBD_n,KBD_o,KBD_p,KBD_q,KBD_r,KBD_s,KBD_t,KBD_u,KBD_v,KBD_w,KBD_x,KBD_y,KBD_z}; k=letters[c-'a'];return true;} if(c>='0'&&c<='9'){ static const KBD_KEYS d[]={KBD_0,KBD_1,KBD_2,KBD_3,KBD_4,KBD_5,KBD_6,KBD_7,KBD_8,KBD_9}; k=d[c-'0'];return true;} } return false;
+}
+
+std::string ascii_lower(std::string value)
+{
+    for (auto &c : value) {
+        if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    }
+    return value;
 }
 
 bool parse(const std::string &line, Event &e)
@@ -123,27 +153,44 @@ bool parse(const std::string &line, Event &e)
     std::string token;
     while (input >> token) t.push_back(token);
     long long delay = 0, duration = 0, x = 0, y = 0;
-    if (t.size() == 4 && t[0] == "KEY") {
+    const std::string verb = t.empty() ? std::string() : ascii_lower(t[0]);
+    if (t.size() == 4 && verb == "key") {
         if (!number(t[1], delay) || !number(t[2], duration) ||
             delay < 0 || delay > MAX_DELAY || duration < 1 ||
             duration > MAX_DELAY || delay > MAX_DELAY - duration ||
-            !keyname(t[3], e.key)) return false;
+            !keyname(ascii_lower(t[3]), e.key)) return false;
         e.kind = Event::Key;
         e.duration = uint32_t(duration);
-    } else if (t.size() == 5 && t[0] == "MOUSE") {
+    } else if (t.size() == 5 && verb == "mouse") {
         if (!number(t[2], delay) || delay < 0 || delay > MAX_DELAY) return false;
-        if (t[1] == "MOVE") {
+        const std::string operation = ascii_lower(t[1]);
+        if (operation == "move") {
             if (!number(t[3], x) || !number(t[4], y) ||
                 x < -32768 || x > 32767 || y < -32768 || y > 32767) return false;
             e.kind = Event::Move; e.x = int(x); e.y = int(y);
-        } else if (t[1] == "BUTTON") {
-            if (t[3] != "left" && t[3] != "right" && t[3] != "middle") return false;
-            if (t[4] != "press" && t[4] != "release") return false;
+        } else if (operation == "abs") {
+            if (!number(t[3], x) || !number(t[4], y) ||
+                x < 0 || x >= 360 || y < 0 || y >= 240) return false;
+            e.kind = Event::Absolute; e.x = int(x); e.y = int(y);
+        } else if (operation == "button") {
+            const std::string button = ascii_lower(t[3]);
+            const std::string action = ascii_lower(t[4]);
+            if (button != "left" && button != "right" && button != "middle") return false;
+            if (action != "press" && action != "release") return false;
             e.kind = Event::Button;
-            e.button = t[3] == "left" ? 0 : t[3] == "right" ? 1 : 2;
-            e.pressed = t[4] == "press";
+            e.button = button == "left" ? 0 : button == "right" ? 1 : 2;
+            e.pressed = action == "press";
         } else return false;
-    } else if (t.size() == 5 && t[0] == "MEMDUMP") {
+    } else if (t.size() == 4 && verb == "rng" && ascii_lower(t[1]) == "seed") {
+        if (!number(t[2], delay) || delay < 0 || delay > MAX_DELAY ||
+            !number(t[3], x, 16) || x < 0 ||
+            uint64_t(x) > uint64_t(std::numeric_limits<uint32_t>::max()))
+            return false;
+        e.kind = Event::Seed; e.seed = uint32_t(x);
+    } else if (t.size() == 3 && verb == "cpu" && ascii_lower(t[1]) == "state") {
+        if (!number(t[2], delay) || delay < 0 || delay > MAX_DELAY) return false;
+        e.kind = Event::CpuState;
+    } else if (t.size() == 5 && verb == "memdump") {
         if (!number(t[1], delay) || delay < 0 || delay > MAX_DELAY ||
             !number(t[2], x, 16) || !number(t[3], y, 16) ||
             x < 0 || x > MAX_DUMP || y < 1 || y > MAX_DUMP || x > MAX_DUMP - y)
@@ -189,6 +236,7 @@ void callback(Bitu value)
             KEYBOARD_AddKey(e.key, true);
             s.pressed_keys.insert(e.key);
             e.started = true;
+            e.keyboard_space = KEYBOARD_BufferSpaceAvail();
             record(e, "pressed");
             PIC_AddEvent(callback, double(e.duration), value);
             return;
@@ -196,9 +244,16 @@ void callback(Bitu value)
         KEYBOARD_AddKey(e.key, false);
         s.pressed_keys.erase(e.key);
         s.reserved_keys.erase(e.key);
+        e.keyboard_space = KEYBOARD_BufferSpaceAvail();
         break;
     case Event::Move:
         Mouse_CursorInjected(float(e.x), float(e.y), 0, 0, true);
+        break;
+    case Event::Absolute:
+        Mouse_CursorInjected(0, 0,
+                             float(e.x) / 359.0f,
+                             float(e.y) / 239.0f,
+                             false);
         break;
     case Event::Button:
         if (e.pressed) { Mouse_ButtonPressed(uint8_t(e.button)); s.pressed_buttons.insert(e.button); }
@@ -207,6 +262,29 @@ void callback(Bitu value)
     case Event::Dump:
         error = dump(e);
         break;
+    case Event::Seed:
+        if (mem_writed_checked(LinearPt(ALBION_SHARED_RNG_ADDRESS), e.seed))
+            error = "write";
+        break;
+    case Event::CpuState: {
+        e.cpu_cs = SegValue(cs);
+        e.cpu_eip = reg_eip;
+        e.cpu_linear = uint32_t(SegPhys(cs) + reg_eip);
+        e.cpu_ss = SegValue(ss);
+        e.cpu_esp = reg_esp;
+        const LinearPt stack = LinearPt(SegPhys(ss) + reg_esp);
+        e.cpu_stack.reserve(128);
+        for (uint32_t i = 0; i < 128; ++i) {
+            uint32_t value = 0;
+            if (mem_readd_checked(stack + i * 4, &value)) {
+                error = "read";
+                e.cpu_stack.clear();
+                break;
+            }
+            e.cpu_stack.push_back(value);
+        }
+        break;
+    }
     }
     record(e, error ? "error" : "done", error ? error : "");
     s.events.erase(found);

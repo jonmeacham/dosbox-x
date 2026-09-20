@@ -8,16 +8,26 @@ static std::vector<std::tuple<double,PIC_EventHandler,Bitu>> queue;
 static std::vector<std::pair<KBD_KEYS,bool>> keys;
 static std::vector<std::pair<int,bool>> buttons;
 static std::vector<std::pair<int,int>> moves;
+static std::vector<std::pair<float,float>> positions;
+static std::vector<std::pair<LinearPt,uint32_t>> writes;
+uint32_t test_reg_eip=0x736c8,test_reg_esp=0x1000,test_seg_base[2]={0x17b000,0x200000};
+uint16_t test_seg_value[2]={0x1234,0x5678};
 double PIC_FullIndex() { return ticks; }
 void PIC_AddEvent(PIC_EventHandler f,double delay,Bitu id) { queue.emplace_back(ticks+delay,f,id); }
 void PIC_RemoveEvents(PIC_EventHandler f) {
     queue.erase(std::remove_if(queue.begin(),queue.end(),[f](const auto &e){return std::get<1>(e)==f;}),queue.end());
 }
 void KEYBOARD_AddKey(KBD_KEYS key,bool pressed) { keys.emplace_back(key,pressed); }
+size_t KEYBOARD_BufferSpaceAvail() { return 31; }
 void Mouse_ButtonPressed(uint8_t b) { buttons.emplace_back(b,true); }
 void Mouse_ButtonReleased(uint8_t b) { buttons.emplace_back(b,false); }
-void Mouse_CursorInjected(float x,float y,float,float,bool relative) { assert(relative); moves.emplace_back(int(x),int(y)); }
+void Mouse_CursorInjected(float xrel,float yrel,float x,float y,bool relative) {
+    if (relative) moves.emplace_back(int(xrel),int(yrel));
+    else positions.emplace_back(x,y);
+}
 bool mem_readb_checked(LinearPt address,uint8_t *v) { *v=uint8_t(address); return address == 0xdead; }
+bool mem_readd_checked(LinearPt address,uint32_t *v) { *v=address^0x12345678u; return false; }
+bool mem_writed_checked(LinearPt address,uint32_t value) { writes.emplace_back(address,value); return false; }
 static void advance(double target) {
     for (;;) {
         std::stable_sort(queue.begin(),queue.end(),[](const auto &a,const auto &b){return std::get<0>(a)<std::get<0>(b);});
@@ -45,13 +55,33 @@ int main(int argc,char **argv) {
     assert(argc==2);
     const std::vector<std::string> invalid={"KEY -1 10 a","KEY 0 -1 a","KEY 0 0 a","KEY 600000 1 a",
         "KEY 9223372036854775807 9223372036854775807 a","KEY 0 10 bad","KEY 0 10 a extra",
-        "MOUSE MOVE -1 0 0","MOUSE MOVE 0 -32769 0","MOUSE BUTTON 0 left invalid",
+        "MOUSE MOVE -1 0 0","MOUSE MOVE 0 -32769 0","MOUSE ABS 0 -1 0","MOUSE ABS 0 360 0",
+        "MOUSE ABS 0 0 240","MOUSE BUTTON 0 left invalid",
+        "RNG SEED -1 1","RNG SEED 0 nope","RNG SEED 0 100000000","RNG SEED 0 1 extra",
+        "CPU STATE -1","CPU STATE 600001","CPU STATE 0 extra",
         "MEMDUMP 0 -1 1 out","MEMDUMP 0 0 1 out extra","MEMDUMP 0 ffffff 2 out",
         "MEMDUMP 0 0 1 ../out","MEMDUMP 0 0 1 /out",std::string("KEY 0 10 a\0",11)};
     for (const auto &line:invalid) { Event e; assert(!parse(line,e)); }
     const KBD_KEYS expected[]={KBD_a,KBD_b,KBD_c,KBD_d,KBD_e,KBD_f,KBD_g,KBD_h,KBD_i,KBD_j,KBD_k,KBD_l,KBD_m,KBD_n,KBD_o,KBD_p,KBD_q,KBD_r,KBD_s,KBD_t,KBD_u,KBD_v,KBD_w,KBD_x,KBD_y,KBD_z};
     for (int i=0;i<26;++i) {Event e; assert(parse(std::string("KEY 0 10 ")+char('a'+i),e));assert(e.key==expected[i]);}
+    const std::vector<std::pair<std::string,KBD_KEYS>> named_keys={
+        {"escape",KBD_esc},{"esc",KBD_esc},{"enter",KBD_enter},{"return",KBD_enter},
+        {"space",KBD_space},{"tab",KBD_tab},{"backspace",KBD_backspace},
+        {"up",KBD_up},{"down",KBD_down},{"left",KBD_left},{"right",KBD_right},
+        {"insert",KBD_insert},{"delete",KBD_delete},{"home",KBD_home},{"end",KBD_end},
+        {"pageup",KBD_pageup},{"pagedown",KBD_pagedown},
+        {"lctrl",KBD_leftctrl},{"control",KBD_leftctrl},
+        {"lalt",KBD_leftalt},{"option",KBD_leftalt},
+        {"lshift",KBD_leftshift},{"shift",KBD_leftshift},
+        {"lcmd",KBD_lwindows},{"command",KBD_lwindows},
+    };
+    for (const auto &entry:named_keys) { Event key; assert(parse("KEY 0 10 "+entry.first,key)); assert(key.key==entry.second); }
+    for (char digit='0';digit<='9';++digit) { Event key; assert(parse(std::string("KEY 0 10 ")+digit,key)); }
     Event e; assert(parse("MOUSE MOVE 0 -10 12",e)&&e.x==-10&&e.y==12);
+    assert(parse("mouse abs 3 359 239",e)&&e.kind==Event::Absolute&&e.x==359&&e.y==239);
+    assert(parse("Key 0 10 RETURN",e)&&e.key==KBD_enter);
+    assert(parse("RNG SEED 4 0x752162d1",e)&&e.seed==0x752162d1);
+    assert(parse("RNG SEED 0 ffffffff",e)&&e.seed==0xffffffffu);
     // Disabled mode has no descriptors, socket, log, or scheduled events.
     unsetenv("DOSBOX_X_GUEST_CONTROL_SOCKET"); unsetenv("DOSBOX_X_GUEST_CONTROL_DIR");
     GuestControl_Poll(); assert(s.disabled && s.listener<0 && s.log<0 && queue.empty());
@@ -66,8 +96,9 @@ int main(int argc,char **argv) {
     advance(0); assert(keys.back()==std::make_pair(KBD_b,true));
     advance(10); assert(keys.back()==std::make_pair(KBD_b,false)); assert(s.events.empty());
     GuestControl_Poll(); assert(drain(fd).find("done")!=std::string::npos);
-    send_text(fd,"MOUSE BUTTON 0 right press\nMOUSE BUTTON 1 right release\nMOUSE MOVE 0 -10 12\n");
-    advance(11); assert(buttons[0]==std::make_pair(1,true)&&buttons[1]==std::make_pair(1,false)); assert(moves.back()==std::make_pair(-10,12));
+    send_text(fd,"MOUSE BUTTON 0 right press\nMOUSE BUTTON 1 right release\nMOUSE MOVE 0 -10 12\nMOUSE ABS 2 359 239\n");
+    advance(12); assert(buttons[0]==std::make_pair(1,true)&&buttons[1]==std::make_pair(1,false)); assert(moves.back()==std::make_pair(-10,12));
+    assert(positions.back()==std::make_pair(1.0f,1.0f));
     const auto before=moves.size();
     send_text(fd,std::string(600,'x')); send_text(fd,"MOUSE MOVE 0 1 1\n"); advance(12); assert(moves.size()==before);
     send_text(fd,"MOUSE MOVE 0 2 3\n"); advance(12); assert(moves.back()==std::make_pair(2,3));
@@ -75,6 +106,12 @@ int main(int argc,char **argv) {
     int dumpfd=open((dir+"/bytes.bin").c_str(),O_RDONLY); char data[4]; assert(read(dumpfd,data,4)==4);close(dumpfd);assert(data[0]==16&&data[3]==19);
     send_text(fd,"MEMDUMP 0 20 4 bytes.bin\nMEMDUMP 0 dead 1 bad.bin\n");advance(12);
     dumpfd=open((dir+"/bytes.bin").c_str(),O_RDONLY);assert(read(dumpfd,data,4)==4&&data[0]==16);close(dumpfd);assert(access((dir+"/bad.bin").c_str(),F_OK)!=0);
+    send_text(fd,"RNG SEED 0 752162d1\n"); advance(12);
+    assert(writes.back()==std::make_pair(LinearPt(0x2bafa4),uint32_t(0x752162d1)));
+    send_text(fd,"cpu state 0\n"); advance(12); GuestControl_Poll();
+    const auto cpu_reply=drain(fd); assert(cpu_reply.find("\"eip\":472776")!=std::string::npos);
+    assert(cpu_reply.find("\"linear\":2025160")!=std::string::npos);
+    assert(cpu_reply.find("\"stack\":[")!=std::string::npos);
     send_text(fd,"MOUSE MOVE 50 7 8\n"); const auto old_session=s.session; close(fd);GuestControl_Poll();
     fd=connect_client(path); assert(s.session!=old_session); advance(62); GuestControl_Poll();assert(drain(fd).empty());assert(moves.back()==std::make_pair(7,8));
     // Queue cap rejects additional work without dropping accepted events.
@@ -93,5 +130,5 @@ int main(int argc,char **argv) {
     const size_t pending_before=s.events.size();
     schedule("MOUSE MOVE 0 3 4"); assert(s.failed && s.events.size()==pending_before);
     GuestControl_Poll();assert(queue.empty()&&s.events.empty());assert(keys.back()==std::make_pair(KBD_a,false));assert(buttons.back()==std::make_pair(2,false));assert(access(path.c_str(),F_OK)!=0);close(fd);
-    std::cout<<"PASS: actual C++ parser, alphabet, callbacks, socket framing, dump integrity, reconnect isolation, shutdown\n";
+    std::cout<<"PASS: actual C++ parser, shared key alphabet, relative/absolute pointer callbacks, socket framing, dump integrity, scoped RNG seed, reconnect isolation, shutdown\n";
 }
