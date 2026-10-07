@@ -2498,7 +2498,7 @@ static void capture_scheduled_exec_dumps() {
 		}
 		const uint32_t registers[16] = {static_cast<uint32_t>(PIC_FullIndex()), linear_ip,
 			reg_eip, reg_eax, reg_ebx, reg_ecx, reg_edx, reg_esi, reg_edi, reg_ebp,
-			reg_esp, reg_flags, SegValue(cs), SegValue(ds), SegValue(es), SegValue(ss)};
+			reg_esp, static_cast<uint32_t>(reg_flags), SegValue(cs), SegValue(ds), SegValue(es), SegValue(ss)};
 		if (request.buffered) {
 			auto *record = request.records.data() + request.record_bytes;
 			for (size_t word = 0; word < 16; ++word)
