@@ -6,6 +6,7 @@ callback.h \
 cpu.h \
 cross.h \
 control.h \
+guest_control.h \
 debug.h \
 dma.h \
 dos_inc.h \
