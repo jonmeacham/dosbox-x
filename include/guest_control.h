@@ -1,9 +1,9 @@
 #ifndef DOSBOX_GUEST_CONTROL_H
 #define DOSBOX_GUEST_CONTROL_H
 
-/* Opt-in, guest-only control socket.  The normal loop calls this without
- * changing behavior unless DOSBOX_X_GUEST_CONTROL_SOCKET is set. */
-void GuestControl_Poll();
+/* Opt-in control socket.  True makes Normal_Loop yield before another CPU
+ * chunk, for a debugger transition or while its acknowledgment drains. */
+bool GuestControl_Poll();
 void GuestControl_Shutdown();
 
 #endif

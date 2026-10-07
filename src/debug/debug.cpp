@@ -342,6 +342,7 @@ extern Bitu cycle_count;
 static bool debugging = false;
 static bool debug_running = false;
 static bool check_rescroll = false;
+static bool host_pause_marker_pending = false;
 
 static FPU_rec oldfpu;
 static bool warn_dynamic = false;
@@ -6060,6 +6061,10 @@ void dyn_core_dh_debug_flush (void);
 #endif
 
 Bitu DEBUG_Loop(void) {
+	if (host_pause_marker_pending) {
+		host_pause_marker_pending = false;
+		DEBUG_ShowMsg("Guest-control debugger paused.\n");
+	}
     if (debug_running) {
         Bitu now = SDL_GetTicks();
 
@@ -6945,6 +6950,44 @@ Bitu DEBUG_EnableDebugger(void)
 	CPU_CycleLeft += CPU_Cycles;
 	CPU_Cycles = 0;
 	return 0;
+}
+
+bool DEBUG_HostPauseAvailable(void)
+{
+#if C_DEBUG
+	if (control->opt_display2 || DOSBOX_GetLoop() == DEBUG_Loop ||
+	    debugging || debug_running)
+		return false;
+#if defined(MACOSX) || defined(LINUX)
+	if (!isatty(0) || !isatty(1) || !isatty(2))
+		return false;
+#endif
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool DEBUG_RequestHostPause(void)
+{
+#if C_DEBUG
+	if (!DEBUG_HostPauseAvailable())
+		return false;
+	const bool old_tohide = tohide;
+	tohide = false;
+	debugrunmode = 0;
+	runnormal = false;
+	DEBUG_EnableDebugger();
+	tohide = old_tohide;
+	if (DOSBOX_GetLoop() != DEBUG_Loop || !debugging || debug_running)
+		return false;
+	if (!DEBUG_ExitLoop())
+		return false;
+	host_pause_marker_pending = true;
+	return true;
+#else
+	return false;
+#endif
 }
 
 // INIT

@@ -467,7 +467,8 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
-            GuestControl_Poll();
+            if (GuestControl_Poll())
+                return 0;
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();

@@ -9,6 +9,9 @@
 #include "pic.h"
 #include "mem.h"
 #include "paging.h"
+#if C_DEBUG
+#include "debug.h"
+#endif
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -32,7 +35,7 @@ constexpr size_t MAX_LINE = 512, MAX_PENDING = 128, MAX_OUT = 65536;
 constexpr uint32_t MAX_DELAY = 600000, MAX_DUMP = 16 * 1024 * 1024;
 constexpr uint32_t ALBION_SHARED_RNG_ADDRESS = 0x2bafa4;
 struct Event {
-    enum Kind { Key, Move, Absolute, Button, Dump, Seed, CpuState } kind = Move;
+    enum Kind { Key, Move, Absolute, Button, Dump, Seed, CpuState, DebugPause } kind = Move;
     uint64_t id = 0, session = 0;
     uint32_t delay = 0, duration = 0, address = 0, length = 0, seed = 0;
     KBD_KEYS key = KBD_NONE;
@@ -53,6 +56,8 @@ struct State {
     std::deque<std::string> output;
     size_t output_bytes = 0;
     std::map<uint64_t, Event> events;
+    Event debug_pause_event;
+    bool debug_pause_ready = false;
     std::set<KBD_KEYS> reserved_keys, pressed_keys;
     std::set<int> pressed_buttons;
 } s;
@@ -84,6 +89,7 @@ void disconnect()
 {
     if (s.client >= 0) close(s.client);
     s.client = -1;
+    s.debug_pause_ready = false;
     s.input.clear();
     s.discarding = false;
     s.output.clear();
@@ -190,6 +196,13 @@ bool parse(const std::string &line, Event &e)
     } else if (t.size() == 3 && verb == "cpu" && ascii_lower(t[1]) == "state") {
         if (!number(t[2], delay) || delay < 0 || delay > MAX_DELAY) return false;
         e.kind = Event::CpuState;
+    } else if (t.size() == 3 && verb == "debug" && ascii_lower(t[1]) == "pause") {
+#if C_DEBUG
+        if (!number(t[2], delay) || delay != 0) return false;
+        e.kind = Event::DebugPause;
+#else
+        return false;
+#endif
     } else if (t.size() == 5 && verb == "memdump") {
         if (!number(t[1], delay) || delay < 0 || delay > MAX_DELAY ||
             !number(t[2], x, 16) || !number(t[3], y, 16) ||
@@ -304,11 +317,27 @@ void schedule(const std::string &line, const char *forced_error = nullptr)
     ++s.next;
     const char *error = forced_error;
     if (!error && !parse(line, e)) error = "syntax_or_range";
+    if (!error && s.debug_pause_ready) error = "pause_pending";
     if (!error && s.events.size() >= MAX_PENDING) error = "queue_full";
     if (!error && e.kind == Event::Key && s.reserved_keys.count(e.key)) error = "key_pending";
+    if (!error && e.kind == Event::DebugPause &&
+        (s.debug_pause_ready || !s.events.empty() || !s.pressed_keys.empty() ||
+         !s.pressed_buttons.empty())) error = "control_busy";
+#if C_DEBUG
+    if (!error && e.kind == Event::DebugPause && !DEBUG_HostPauseAvailable())
+        error = "debugger_unavailable";
+#endif
     if (error) { record(e, "rejected", error); return; }
     record(e, "enqueued");
     if (s.failed) return;
+    if (e.kind == Event::DebugPause) {
+        s.debug_pause_event = e;
+        s.debug_pause_ready = true;
+        // `done` acknowledges an accepted request; the PTY marker confirms
+        // that DEBUG_Loop actually started after this receipt was drained.
+        record(e, "done");
+        return;
+    }
     s.events.emplace(e.id, e);
     if (e.kind == Event::Key) s.reserved_keys.insert(e.key);
     PIC_AddEvent(callback, double(e.delay), Bitu(e.id));
@@ -357,11 +386,11 @@ void init()
 }
 } // namespace
 
-void GuestControl_Poll()
+bool GuestControl_Poll()
 {
     if (!s.initialized) init();
-    if (s.disabled) return;
-    if (s.failed) { GuestControl_Shutdown(); return; }
+    if (s.disabled) return false;
+    if (s.failed) { GuestControl_Shutdown(); return false; }
     if (s.client < 0) {
         const int fd = accept(s.listener, nullptr, nullptr);
         if (fd >= 0) {
@@ -369,12 +398,17 @@ void GuestControl_Poll()
             else { s.client = fd; ++s.session; }
         }
     }
-    if (s.client < 0) return;
+    if (s.debug_pause_ready &&
+        (s.client < 0 || s.debug_pause_event.session != s.session)) {
+        record(s.debug_pause_event, "cancelled", "owner_disconnected");
+        s.debug_pause_ready = false;
+    }
+    if (s.client < 0) return false;
     // A single bounded read is parsed bytewise: overlong line suffixes are discarded.
     char buffer[256];
     const ssize_t count = recv(s.client, buffer, sizeof(buffer), 0);
     if (count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-        disconnect(); return;
+        disconnect(); return false;
     }
     for (ssize_t i = 0; i < count && s.client >= 0 && !s.failed; ++i) {
         const char c = buffer[i];
@@ -406,7 +440,20 @@ void GuestControl_Poll()
         if (size_t(n) == line.size()) s.output.pop_front();
         else line.erase(0, size_t(n));
     }
-    if (s.failed) GuestControl_Shutdown();
+    if (s.failed) { GuestControl_Shutdown(); return false; }
+
+    if (s.debug_pause_ready && s.client >= 0 &&
+        s.debug_pause_event.session == s.session) {
+#if C_DEBUG
+        if (!s.output.empty()) return true;
+        s.debug_pause_ready = false;
+        if (DEBUG_RequestHostPause()) return true;
+        // Availability was validated before the event was queued; this is a
+        // log-only safeguard for an unexpected state change in the same turn.
+        record(s.debug_pause_event, "error", "debugger_transition_failed");
+#endif
+    }
+    return false;
 }
 void GuestControl_Shutdown()
 {
@@ -426,6 +473,6 @@ void GuestControl_Shutdown()
     s.socket_created = false;
 }
 #else
-void GuestControl_Poll() {}
+bool GuestControl_Poll() { return false; }
 void GuestControl_Shutdown() {}
 #endif
