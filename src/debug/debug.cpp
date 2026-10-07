@@ -2320,11 +2320,22 @@ struct ScheduledExecDump {
 	std::string register_name = {};
 	std::string filename = {};
 	std::ofstream output = {};
+	// ADDEXECBUFFER keeps the same DXEXE001 record shape but writes each hit
+	// into storage reserved before execution. File I/O is deferred until the
+	// guest-clock timeout or an explicit FLUSHEXECBUFFER command.
+	bool buffered = false;
+	bool capture_enabled = true;
+	bool read_failed = false;
+	std::vector<uint8_t> records = {};
+	size_t record_bytes = 0;
 	bool armed = false;
 };
 
 static std::list<ScheduledExecDump> scheduled_exec_dumps = {};
 static uint32_t next_scheduled_exec_dump_id = 1;
+static size_t scheduled_exec_buffer_bytes = 0;
+static constexpr size_t max_scheduled_exec_buffer_bytes = 1024u * 1024u;
+static constexpr size_t exec_dump_register_bytes = 16u * sizeof(uint32_t);
 
 static ScheduledExecDump *find_scheduled_exec_dump(const uint32_t id) {
 	for (auto &request : scheduled_exec_dumps)
@@ -2344,6 +2355,41 @@ static void close_scheduled_exec_dump(ScheduledExecDump &request) {
 	if (request.output.is_open()) request.output.close();
 }
 
+static void release_scheduled_exec_buffer(ScheduledExecDump &request) {
+	if (!request.buffered || request.records.empty()) return;
+	scheduled_exec_buffer_bytes -= request.records.size();
+	request.records.clear();
+}
+
+static void flush_scheduled_exec_buffer(ScheduledExecDump &request) {
+	if (!request.buffered || request.read_failed || request.record_bytes == 0) {
+		release_scheduled_exec_buffer(request);
+		return;
+	}
+	std::ofstream output(request.filename, std::ios::binary | std::ios::trunc);
+	if (output) {
+		output.write("DXEXE001",8);
+		write_exec_dump_u32(output,request.snapshot_address);
+		write_exec_dump_u32(output,request.length);
+		output.write(reinterpret_cast<const char *>(request.records.data()),
+		             static_cast<std::streamsize>(request.record_bytes));
+	}
+	const bool failed = !output;
+	output.close();
+	if (failed) {
+		LOG_MSG("ADDEXECBUFFER failed writing '%s'",request.filename.c_str());
+		std::remove(request.filename.c_str());
+	}
+	release_scheduled_exec_buffer(request);
+}
+
+static void write_exec_buffer_u32(uint8_t *destination, const uint32_t value) {
+	destination[0] = static_cast<uint8_t>(value & 0xffu);
+	destination[1] = static_cast<uint8_t>((value >> 8u) & 0xffu);
+	destination[2] = static_cast<uint8_t>((value >> 16u) & 0xffu);
+	destination[3] = static_cast<uint8_t>((value >> 24u) & 0xffu);
+}
+
 static void invalidate_scheduled_exec_dump(ScheduledExecDump &request) {
 	close_scheduled_exec_dump(request);
 	// A valid prefix must not be mistaken for a successfully completed trace.
@@ -2354,6 +2400,10 @@ static void delayed_exec_dump_arm(Bitu opaque) {
 	const auto id = static_cast<uint32_t>(opaque);
 	auto *request = find_scheduled_exec_dump(id);
 	if (!request) return;
+	if (request->buffered) {
+		request->armed = true;
+		return;
+	}
 	request->output.open(request->filename,
 	                     std::ios::binary | std::ios::trunc);
 	if (!request->output) {
@@ -2382,7 +2432,8 @@ static void delayed_exec_dump_timeout(Bitu opaque) {
 	const auto id = static_cast<uint32_t>(opaque);
 	auto *request = find_scheduled_exec_dump(id);
 	if (!request) return;
-	close_scheduled_exec_dump(*request);
+	if (request->buffered) flush_scheduled_exec_buffer(*request);
+	else close_scheduled_exec_dump(*request);
 	scheduled_exec_dumps.remove_if([id](const ScheduledExecDump &item) {
 		return item.id == id;
 	});
@@ -2405,7 +2456,7 @@ static void capture_scheduled_exec_dumps() {
 	for (auto it = scheduled_exec_dumps.begin();
 	     it != scheduled_exec_dumps.end();) {
 		auto &request = *it;
-		if (!request.armed || request.linear_ip != linear_ip ||
+		if (!request.armed || !request.capture_enabled || request.linear_ip != linear_ip ||
 		    (request.register_name != "ANY" &&
              request.register_value != scheduled_exec_dump_register_value(request))) {
 			++it;
@@ -2414,49 +2465,64 @@ static void capture_scheduled_exec_dumps() {
 		/* Materialize lazy flags only for matched instructions, not every
 		 * instruction during the scheduled delay or capture window. */
 		FillFlags();
-		std::vector<uint8_t> bytes(request.length);
+		std::vector<uint8_t> bytes;
+		uint8_t *memory_destination = nullptr;
+		if (request.buffered) {
+			memory_destination = request.records.data() + request.record_bytes +
+			                     exec_dump_register_bytes;
+		} else {
+			bytes.resize(request.length);
+			memory_destination = bytes.data();
+		}
 		bool failed = false;
 		for (uint32_t offset = 0; offset < request.length; ++offset) {
 			if (mem_readb_checked(static_cast<PhysPt>(request.snapshot_address + offset),
-			                     &bytes[offset])) {
+			                     &memory_destination[offset])) {
 				failed = true;
 				break;
 			}
 		}
 		if (failed) {
+			if (request.buffered) {
+				request.read_failed = true;
+				request.capture_enabled = false;
+				++request.hits;
+				++it;
+				continue;
+			}
 			LOG_MSG("ADDEXECDUMP failed reading snapshot memory for '%s'",
 			        request.filename.c_str());
 			invalidate_scheduled_exec_dump(request);
 			it = scheduled_exec_dumps.erase(it);
 			continue;
 		}
-		write_exec_dump_u32(request.output,static_cast<uint32_t>(PIC_FullIndex()));
-		write_exec_dump_u32(request.output,linear_ip);
-		write_exec_dump_u32(request.output,reg_eip);
-		write_exec_dump_u32(request.output,reg_eax);
-		write_exec_dump_u32(request.output,reg_ebx);
-		write_exec_dump_u32(request.output,reg_ecx);
-		write_exec_dump_u32(request.output,reg_edx);
-		write_exec_dump_u32(request.output,reg_esi);
-		write_exec_dump_u32(request.output,reg_edi);
-		write_exec_dump_u32(request.output,reg_ebp);
-		write_exec_dump_u32(request.output,reg_esp);
-		write_exec_dump_u32(request.output,reg_flags);
-		write_exec_dump_u32(request.output,SegValue(cs));
-		write_exec_dump_u32(request.output,SegValue(ds));
-		write_exec_dump_u32(request.output,SegValue(es));
-		write_exec_dump_u32(request.output,SegValue(ss));
-		request.output.write(reinterpret_cast<const char *>(bytes.data()),
-		                    static_cast<std::streamsize>(bytes.size()));
-		if (!request.output) {
+		const uint32_t registers[16] = {static_cast<uint32_t>(PIC_FullIndex()), linear_ip,
+			reg_eip, reg_eax, reg_ebx, reg_ecx, reg_edx, reg_esi, reg_edi, reg_ebp,
+			reg_esp, reg_flags, SegValue(cs), SegValue(ds), SegValue(es), SegValue(ss)};
+		if (request.buffered) {
+			auto *record = request.records.data() + request.record_bytes;
+			for (size_t word = 0; word < 16; ++word)
+				write_exec_buffer_u32(record + word * sizeof(uint32_t), registers[word]);
+			request.record_bytes += exec_dump_register_bytes + request.length;
+		} else {
+			for (const auto value : registers) write_exec_dump_u32(request.output,value);
+			request.output.write(reinterpret_cast<const char *>(bytes.data()),
+			                     static_cast<std::streamsize>(bytes.size()));
+		}
+		if (!request.buffered && !request.output) {
 			LOG_MSG("ADDEXECDUMP failed writing '%s'",request.filename.c_str());
 			invalidate_scheduled_exec_dump(request);
 			it = scheduled_exec_dumps.erase(it);
 			continue;
 		}
 		if (++request.hits >= request.max_hits) {
-			close_scheduled_exec_dump(request);
-			it = scheduled_exec_dumps.erase(it);
+			if (request.buffered) {
+				request.capture_enabled = false;
+				++it;
+			} else {
+				close_scheduled_exec_dump(request);
+				it = scheduled_exec_dumps.erase(it);
+			}
 		} else {
 			++it;
 		}
@@ -3612,7 +3678,8 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
-	if (command == "ADDEXECDUMP") {
+	if (command == "ADDEXECDUMP" || command == "ADDEXECBUFFER") {
+		const bool buffered = command == "ADDEXECBUFFER";
 		std::istringstream original_stream(original_str);
 		std::string original_command, delay_text, duration_text, ip_text;
 		std::string register_name, register_value_text, hits_text;
@@ -3641,7 +3708,7 @@ bool ParseCommand(char* str) {
 		valid = valid && parse_number(register_value_text,16,register_value) &&
 		        register_value <= UINT32_MAX;
 		valid = valid && parse_number(hits_text,10,max_hits) && max_hits >= 1 &&
-		        max_hits <= 4096;
+		        max_hits <= (buffered ? 64u : 4096u);
 		valid = valid && (register_name == "EAX" || register_name == "EBX" ||
 		                  register_name == "ECX" || register_name == "EDX" ||
 		                  register_name == "ESI" || register_name == "EDI" ||
@@ -3649,19 +3716,24 @@ bool ParseCommand(char* str) {
                           (register_name == "ANY" && register_value == 0));
 		valid = valid && ParseScheduledAddress(address_text,snapshot_address,true);
 		valid = valid && parse_number(length_text,16,length) && length >= 1 &&
-		        length <= 65536 && (max_hits * length <= 64u * 1024u * 1024u);
+		        length <= 65536 &&
+	        (max_hits * length <= (buffered ? max_scheduled_exec_buffer_bytes
+	                                         : 64u * 1024u * 1024u));
 		valid = valid && uint64_t(snapshot_address) + length <= (uint64_t(UINT32_MAX) + 1u);
 #if !C_HEAVY_DEBUG
-		DEBUG_ShowMsg("DEBUG: ADDEXECDUMP requires a heavy-debug build.\n");
+		DEBUG_ShowMsg(buffered ? "DEBUG: ADDEXECBUFFER requires a heavy-debug build.\n"
+		                       : "DEBUG: ADDEXECDUMP requires a heavy-debug build.\n");
 		valid = false;
 #endif
 		if (cpudecoder != &CPU_Core_Normal_Run) {
-			DEBUG_ShowMsg("DEBUG: ADDEXECDUMP requires the normal CPU core.\n");
+			DEBUG_ShowMsg(buffered ? "DEBUG: ADDEXECBUFFER requires the normal CPU core.\n"
+		                       : "DEBUG: ADDEXECDUMP requires the normal CPU core.\n");
 			valid = false;
 		}
 		if (!valid) {
-			DEBUG_ShowMsg("DEBUG: ADDEXECDUMP syntax: delay-ms duration-ms "
-			              "linear-ip register(EAX..ESP/ANY) hex-value(0-for-ANY) max-hits segment:offset "
+			DEBUG_ShowMsg(buffered ? "DEBUG: ADDEXECBUFFER syntax: delay-ms duration-ms "
+			              : "DEBUG: ADDEXECDUMP syntax: delay-ms duration-ms ");
+			DEBUG_ShowMsg("linear-ip register(EAX..ESP/ANY) hex-value(0-for-ANY) max-hits segment:offset "
 			              "hex-length filename.\n");
 			return true;
 		}
@@ -3675,12 +3747,60 @@ bool ParseCommand(char* str) {
 		request.register_value = static_cast<uint32_t>(register_value);
 		request.max_hits = static_cast<uint32_t>(max_hits);
 		request.filename = filename;
+		request.buffered = buffered;
+		if (buffered) {
+			const size_t bytes = static_cast<size_t>(max_hits) *
+			                     (exec_dump_register_bytes + static_cast<size_t>(length));
+			if (bytes > max_scheduled_exec_buffer_bytes - scheduled_exec_buffer_bytes) {
+				DEBUG_ShowMsg("DEBUG: ADDEXECBUFFER memory budget exceeded.\n");
+				return true;
+			}
+			try {
+				request.records.resize(bytes);
+			} catch (const std::bad_alloc &) {
+				DEBUG_ShowMsg("DEBUG: ADDEXECBUFFER allocation failed.\n");
+				return true;
+			}
+			scheduled_exec_buffer_bytes += bytes;
+		}
 		const auto id = request.id;
 		scheduled_exec_dumps.push_back(std::move(request));
 		PIC_AddEvent(&delayed_exec_dump_arm,static_cast<double>(delay),id);
 		PIC_AddEvent(&delayed_exec_dump_timeout,
 		             static_cast<double>(delay + duration),id);
-		DEBUG_ShowMsg("DEBUG: Queued guest-clock execution dump.\n");
+		if (buffered) {
+			char message[96] = {};
+			std::snprintf(message,sizeof(message),
+			              "DEBUG: Queued buffered execution dump id=%u.\n",id);
+			DEBUG_ShowMsg(message);
+		} else {
+			DEBUG_ShowMsg("DEBUG: Queued guest-clock execution dump.\n");
+		}
+		return true;
+	}
+
+	if (command == "FLUSHEXECBUFFER") {
+		std::istringstream stream(original_str);
+		std::string original_command, id_text, trailing;
+		stream >> original_command >> id_text;
+		uint64_t id = 0;
+		bool valid = !stream.fail() && !(stream >> trailing) &&
+		             id_text.find_first_not_of("0123456789") == std::string::npos;
+		if (valid) {
+			try { id = std::stoull(id_text); }
+			catch (...) { valid = false; }
+		}
+		auto *request = valid ? find_scheduled_exec_dump(static_cast<uint32_t>(id)) : nullptr;
+		if (!request || !request->buffered || id > UINT32_MAX) {
+			DEBUG_ShowMsg("DEBUG: FLUSHEXECBUFFER requires an active buffer id.\n");
+			return true;
+		}
+		const auto target_id = request->id;
+		flush_scheduled_exec_buffer(*request);
+		scheduled_exec_dumps.remove_if([target_id](const ScheduledExecDump &item) {
+			return item.id == target_id;
+		});
+		DEBUG_ShowMsg("DEBUG: Flushed buffered execution dump.\n");
 		return true;
 	}
 
@@ -5099,6 +5219,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 		DEBUG_ShowMsg("ADDEXECDUMP delay duration ip reg value hits s:o len file - Capture matched instruction state.\n");
+		DEBUG_ShowMsg("ADDEXECBUFFER delay duration ip reg value hits s:o len file - Buffer up to 64 hits; flush later.\n");
+		DEBUG_ShowMsg("FLUSHEXECBUFFER id - Flush and release one buffered execution trace.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
 		DEBUG_ShowMsg("OUT[P|W|D] [port] [data]  - I/O port write byte/word/dword.\n");
