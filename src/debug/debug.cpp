@@ -2336,6 +2336,7 @@ static std::list<ScheduledExecDump> scheduled_exec_dumps = {};
 static uint32_t next_scheduled_exec_dump_id = 1;
 static size_t scheduled_exec_buffer_bytes = 0;
 static constexpr size_t max_scheduled_exec_buffer_bytes = 1024u * 1024u;
+static constexpr uint32_t max_scheduled_exec_buffer_hits = 1000u;
 static constexpr size_t exec_dump_register_bytes = 16u * sizeof(uint32_t);
 
 static ScheduledExecDump *find_scheduled_exec_dump(const uint32_t id) {
@@ -3709,7 +3710,7 @@ bool ParseCommand(char* str) {
 		valid = valid && parse_number(register_value_text,16,register_value) &&
 		        register_value <= UINT32_MAX;
 		valid = valid && parse_number(hits_text,10,max_hits) && max_hits >= 1 &&
-		        max_hits <= (buffered ? 64u : 4096u);
+		        max_hits <= (buffered ? max_scheduled_exec_buffer_hits : 4096u);
 		valid = valid && (register_name == "EAX" || register_name == "EBX" ||
 		                  register_name == "ECX" || register_name == "EDX" ||
 		                  register_name == "ESI" || register_name == "EDI" ||
@@ -5220,7 +5221,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 		DEBUG_ShowMsg("ADDEXECDUMP delay duration ip reg value hits s:o len file - Capture matched instruction state.\n");
-		DEBUG_ShowMsg("ADDEXECBUFFER delay duration ip reg value hits s:o len file - Buffer up to 64 hits; flush later.\n");
+		DEBUG_ShowMsg("ADDEXECBUFFER delay duration ip reg value hits s:o len file - Buffer up to 1000 hits within 1 MiB; flush later.\n");
 		DEBUG_ShowMsg("FLUSHEXECBUFFER id - Flush and release one buffered execution trace.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
