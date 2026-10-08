@@ -2337,7 +2337,7 @@ static uint32_t next_scheduled_exec_dump_id = 1;
 static size_t scheduled_exec_buffer_bytes = 0;
 // Bounded combat-object witnesses retain several descriptor ranges per paint.
 // Share this budget across all streams; buffers still allocate only on arming.
-static constexpr size_t max_scheduled_exec_buffer_bytes = 32u * 1024u * 1024u;
+static constexpr size_t max_scheduled_exec_buffer_bytes = 128u * 1024u * 1024u;
 static constexpr uint32_t max_scheduled_exec_buffer_hits = 4096u;
 static constexpr size_t exec_dump_register_bytes = 16u * sizeof(uint32_t);
 
