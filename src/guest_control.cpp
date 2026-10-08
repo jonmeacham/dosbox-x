@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 
+extern int CPU_IsDynamicCore(void);
+
 namespace {
 constexpr size_t MAX_LINE = 512, MAX_PENDING = 128, MAX_OUT = 65536;
 constexpr uint32_t MAX_DELAY = 600000, MAX_DUMP = 16 * 1024 * 1024;
@@ -44,6 +46,7 @@ struct Event {
     std::string command, file;
     uint32_t cpu_cs = 0, cpu_eip = 0, cpu_linear = 0;
     uint32_t cpu_ss = 0, cpu_esp = 0;
+    int cpu_dynamic_core = 0;
     std::vector<uint32_t> cpu_stack;
     size_t keyboard_space = 0;
 };
@@ -106,6 +109,7 @@ void record(const Event &e, const char *status, const char *reason = "")
         << ",\"reason\":" << quote(reason);
     if (e.kind == Event::CpuState && !strcmp(status, "done")) {
         out << ",\"cpu\":{\"cs\":" << e.cpu_cs
+            << ",\"dynamicCore\":" << e.cpu_dynamic_core
             << ",\"eip\":" << e.cpu_eip
             << ",\"linear\":" << e.cpu_linear
             << ",\"ss\":" << e.cpu_ss
@@ -280,6 +284,7 @@ void callback(Bitu value)
             error = "write";
         break;
     case Event::CpuState: {
+        e.cpu_dynamic_core = CPU_IsDynamicCore();
         e.cpu_cs = SegValue(cs);
         e.cpu_eip = reg_eip;
         e.cpu_linear = uint32_t(SegPhys(cs) + reg_eip);
