@@ -2310,6 +2310,25 @@ struct ScheduledMemoryDump {
 	std::string filename = {};
 };
 
+// Fixed-size state collected beside a single matched buffered hit. Segment
+// descriptor bytes remain part of the paired RAM snapshot; these fields are
+// the emulator's cached segment values at that same guest instruction.
+struct BufferedExecCPUState {
+	uint32_t registers[16] = {};
+	uint32_t flags = 0;
+	uint32_t cr0 = 0, cr4 = 0, cpl = 0, mpl = 0, pmode = 0;
+	uint32_t direction = 0;
+	uint32_t segmentSelector[6] = {};
+	uint32_t segmentBase[6] = {};
+	uint32_t segmentLimit[6] = {};
+	uint32_t segmentExpandDown[6] = {};
+	uint32_t codeBig = 0;
+	uint32_t stackBig = 0, stackMask = 0, stackNotMask = 0;
+	uint32_t gdtrBase = 0, gdtrLimit = 0;
+	uint32_t idtrBase = 0, idtrLimit = 0;
+	uint32_t ldtrSelector = 0, ldtrBase = 0, ldtrLimit = 0;
+};
+
 struct ScheduledExecDump {
 	uint32_t id = 0;
 	uint32_t snapshot_address = 0;
@@ -2325,6 +2344,9 @@ struct ScheduledExecDump {
 	// into storage reserved before execution. File I/O is deferred until the
 	// guest-clock timeout or an explicit FLUSHEXECBUFFER command.
 	bool buffered = false;
+	bool capture_cpu_state = false;
+	bool cpu_state_captured = false;
+	BufferedExecCPUState cpu_state = {};
 	bool capture_enabled = true;
 	bool read_failed = false;
 	std::vector<uint8_t> records = {};
@@ -2366,6 +2388,56 @@ static void write_exec_dump_u32(std::ofstream &output, const uint32_t value) {
 	                       static_cast<char>((value >> 16u) & 0xffu),
 	                       static_cast<char>((value >> 24u) & 0xffu)};
 	output.write(bytes,4);
+}
+
+static bool write_exec_cpu_state_sidecar(const ScheduledExecDump &request) {
+	if (!request.capture_cpu_state || !request.cpu_state_captured ||
+	    request.max_hits != 1 || request.hits != 1)
+		return false;
+	const auto &s = request.cpu_state;
+	const std::string filename = request.filename + ".cpustate.json";
+	std::ofstream output(filename, std::ios::binary | std::ios::trunc);
+	if (!output) return false;
+	static const char *register_names[16] = {
+		"picFullIndex", "linearPC", "eip", "eax", "ebx", "ecx", "edx",
+		"esi", "edi", "ebp", "esp", "eflags", "cs", "ds", "es", "ss"};
+	output << "{\"schema\":\"DXCPU001\",\"sourceBufferID\":" << request.id
+	       << ",\"recordOrdinal\":0,\"matchedLinearPC\":" << s.registers[1]
+	       << ",\"registerTupleOrder\":[";
+	for (size_t i = 0; i < 16; ++i) {
+		if (i) output << ',';
+		output << '\"' << register_names[i] << '\"';
+	}
+	output << "],\"registerTuple\":[";
+	for (size_t i = 0; i < 16; ++i) {
+		if (i) output << ',';
+		output << s.registers[i];
+	}
+	static const char *segment_names[6] = {"ES", "CS", "SS", "DS", "FS", "GS"};
+	output << "],\"cpu\":{\"flags\":" << s.flags
+	       << ",\"cr0\":" << s.cr0 << ",\"cr4\":" << s.cr4
+	       << ",\"cpl\":" << s.cpl << ",\"mpl\":" << s.mpl
+	       << ",\"protectedMode\":" << s.pmode
+	       << ",\"direction\":" << s.direction
+	       << ",\"codeBig\":" << s.codeBig
+	       << ",\"stackBig\":" << s.stackBig
+	       << ",\"stackMask\":" << s.stackMask
+	       << ",\"stackNotMask\":" << s.stackNotMask << "},\"segments\":{";
+	for (size_t i = 0; i < 6; ++i) {
+		if (i) output << ',';
+		output << '\"' << segment_names[i] << "\":{\"selector\":"
+		       << s.segmentSelector[i] << ",\"cachedBase\":"
+		       << s.segmentBase[i] << ",\"cachedLimit\":"
+		       << s.segmentLimit[i] << ",\"expandDown\":"
+		       << s.segmentExpandDown[i] << '}';
+	}
+	output << "},\"tables\":{\"gdtr\":{\"base\":" << s.gdtrBase
+	       << ",\"limit\":" << s.gdtrLimit << "},\"idtr\":{\"base\":"
+	       << s.idtrBase << ",\"limit\":" << s.idtrLimit
+	       << "},\"ldtr\":{\"selector\":" << s.ldtrSelector
+	       << ",\"cachedBase\":" << s.ldtrBase
+	       << ",\"cachedLimit\":" << s.ldtrLimit << "}}}\n";
+	return static_cast<bool>(output);
 }
 
 static void close_scheduled_exec_dump(ScheduledExecDump &request) {
@@ -2417,6 +2489,11 @@ static bool write_exec_clock_sidecar(ScheduledExecDump &request) {
 
 static void flush_scheduled_exec_buffer(ScheduledExecDump &request) {
 	if (!request.buffered || request.read_failed || request.record_bytes == 0) {
+		if (request.capture_cpu_state) {
+			std::remove(request.filename.c_str());
+			std::remove((request.filename + ".clock").c_str());
+			std::remove((request.filename + ".cpustate.json").c_str());
+		}
 		release_scheduled_exec_buffer(request);
 		return;
 	}
@@ -2433,11 +2510,23 @@ static void flush_scheduled_exec_buffer(ScheduledExecDump &request) {
 	if (failed) {
 		LOG_MSG("ADDEXECBUFFER failed writing '%s'",request.filename.c_str());
 		std::remove(request.filename.c_str());
+		std::remove((request.filename + ".clock").c_str());
+		if (request.capture_cpu_state)
+			std::remove((request.filename + ".cpustate.json").c_str());
 	} else if (!write_exec_clock_sidecar(request)) {
 		LOG_MSG("ADDEXECBUFFER failed writing clock sidecar '%s.clock'",
 		        request.filename.c_str());
 		std::remove(request.filename.c_str());
 		std::remove((request.filename + ".clock").c_str());
+		if (request.capture_cpu_state)
+			std::remove((request.filename + ".cpustate.json").c_str());
+	} else if (request.capture_cpu_state &&
+	           !write_exec_cpu_state_sidecar(request)) {
+		LOG_MSG("ADDEXECBUFFER failed writing CPU state sidecar '%s.cpustate.json'",
+		        request.filename.c_str());
+		std::remove(request.filename.c_str());
+		std::remove((request.filename + ".clock").c_str());
+		std::remove((request.filename + ".cpustate.json").c_str());
 	}
 	release_scheduled_exec_buffer(request);
 }
@@ -2460,6 +2549,40 @@ static void append_exec_buffer_u32(std::vector<uint8_t> &destination,
 static uint32_t exec_clock_flags(void) {
 	return (CPU_CycleAutoAdjust ? 1u : 0u) |
 	       (CPU_SkipCycleAutoAdjust ? 2u : 0u);
+}
+
+static void capture_buffered_exec_cpu_state(ScheduledExecDump &request,
+	                                        const uint32_t registers[16]) {
+	if (!request.capture_cpu_state) return;
+	auto &s = request.cpu_state;
+	for (size_t i = 0; i < 16; ++i) s.registers[i] = registers[i];
+	s.flags = static_cast<uint32_t>(reg_flags);
+	s.cr0 = static_cast<uint32_t>(cpu.cr0);
+	s.cr4 = static_cast<uint32_t>(cpu.cr4);
+	s.cpl = static_cast<uint32_t>(cpu.cpl);
+	s.mpl = static_cast<uint32_t>(cpu.mpl);
+	s.pmode = cpu.pmode ? 1u : 0u;
+	s.direction = static_cast<uint32_t>(cpu.direction);
+	s.codeBig = cpu.code.big ? 1u : 0u;
+	s.stackBig = cpu.stack.big ? 1u : 0u;
+	s.stackMask = cpu.stack.mask;
+	s.stackNotMask = cpu.stack.notmask;
+	static const SegNames segments[6] = {es, cs, ss, ds, fs, gs};
+	for (size_t i = 0; i < 6; ++i) {
+		const auto index = segments[i];
+		s.segmentSelector[i] = SegValue(index);
+		s.segmentBase[i] = static_cast<uint32_t>(Segs.phys[index]);
+		s.segmentLimit[i] = static_cast<uint32_t>(Segs.limit[index]);
+		s.segmentExpandDown[i] = Segs.expanddown[index] ? 1u : 0u;
+	}
+	s.gdtrBase = static_cast<uint32_t>(cpu.gdt.GetBase());
+	s.gdtrLimit = static_cast<uint32_t>(cpu.gdt.GetLimit());
+	s.idtrBase = static_cast<uint32_t>(cpu.idt.GetBase());
+	s.idtrLimit = static_cast<uint32_t>(cpu.idt.GetLimit());
+	s.ldtrSelector = static_cast<uint32_t>(cpu.gdt.SLDT());
+	s.ldtrBase = static_cast<uint32_t>(cpu.gdt.GetLDTBase());
+	s.ldtrLimit = static_cast<uint32_t>(cpu.gdt.GetLDTLimit());
+	request.cpu_state_captured = true;
 }
 
 static void append_exec_clock_hit(ScheduledExecDump &request,
@@ -2635,6 +2758,7 @@ static void capture_scheduled_exec_dumps() {
 			for (size_t word = 0; word < 16; ++word)
 				write_exec_buffer_u32(record + word * sizeof(uint32_t), registers[word]);
 			append_exec_clock_hit(request, linear_ip);
+			capture_buffered_exec_cpu_state(request, registers);
 			request.record_bytes += exec_dump_register_bytes + request.length;
 		} else {
 			for (const auto value : registers) write_exec_dump_u32(request.output,value);
@@ -3819,7 +3943,14 @@ bool ParseCommand(char* str) {
 		original_stream >> original_command >> delay_text >> duration_text >> ip_text
 		                >> register_name >> register_value_text >> hits_text
 		                >> address_text >> length_text >> filename;
-		bool valid = !original_stream.fail() && !(original_stream >> trailing);
+		bool valid = !original_stream.fail();
+		bool capture_cpu_state = false;
+		if (original_stream >> trailing) {
+			capture_cpu_state = trailing == "CPUSTATE";
+			std::string extra;
+			valid = valid && buffered && capture_cpu_state &&
+			        !(original_stream >> extra);
+		}
 		uint64_t delay = 0, duration = 0, linear_ip = 0, register_value = 0;
 		uint64_t max_hits = 0, snapshot_address = 0, length = 0;
 		auto parse_number = [](const std::string &text, const int base,
@@ -3841,6 +3972,7 @@ bool ParseCommand(char* str) {
 		        register_value <= UINT32_MAX;
 		valid = valid && parse_number(hits_text,10,max_hits) && max_hits >= 1 &&
 		        max_hits <= (buffered ? max_scheduled_exec_buffer_hits : 4096u);
+		valid = valid && (!capture_cpu_state || (buffered && max_hits == 1));
 		valid = valid && (register_name == "EAX" || register_name == "EBX" ||
 		                  register_name == "ECX" || register_name == "EDX" ||
 		                  register_name == "ESI" || register_name == "EDI" ||
@@ -3871,7 +4003,7 @@ bool ParseCommand(char* str) {
 			DEBUG_ShowMsg(buffered ? "DEBUG: ADDEXECBUFFER syntax: delay-ms duration-ms "
 			              : "DEBUG: ADDEXECDUMP syntax: delay-ms duration-ms ");
 			DEBUG_ShowMsg("linear-ip register(EAX..ESP/ANY) hex-value(0-for-ANY) max-hits segment:offset "
-			              "hex-length filename.\n");
+			              "hex-length filename [CPUSTATE for one buffered hit].\n");
 			return true;
 		}
 		ScheduledExecDump request;
@@ -3885,6 +4017,7 @@ bool ParseCommand(char* str) {
 		request.max_hits = static_cast<uint32_t>(max_hits);
 		request.filename = filename;
 		request.buffered = buffered;
+		request.capture_cpu_state = capture_cpu_state;
 		if (buffered) {
 			const size_t record_bytes = static_cast<size_t>(max_hits) *
 			                             (exec_dump_register_bytes + static_cast<size_t>(length));
@@ -3893,7 +4026,11 @@ bool ParseCommand(char* str) {
 			const size_t cycle_change_bytes =
 				static_cast<size_t>(max_scheduled_cycle_change_records) *
 				exec_cycle_change_record_bytes;
-			const size_t bytes = record_bytes + clock_bytes + cycle_change_bytes;
+			const size_t cpu_state_bytes = capture_cpu_state
+			                                     ? sizeof(BufferedExecCPUState)
+			                                     : 0;
+			const size_t bytes = record_bytes + clock_bytes + cycle_change_bytes +
+			                     cpu_state_bytes;
 			if (bytes > max_scheduled_exec_buffer_bytes - scheduled_exec_buffer_bytes) {
 				DEBUG_ShowMsg("DEBUG: ADDEXECBUFFER memory budget exceeded.\n");
 				return true;
