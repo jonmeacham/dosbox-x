@@ -2350,7 +2350,7 @@ static size_t scheduled_exec_buffer_bytes = 0;
 static constexpr size_t max_scheduled_exec_buffer_bytes = 128u * 1024u * 1024u;
 static constexpr uint32_t max_scheduled_exec_buffer_hits = 4096u;
 static constexpr size_t exec_dump_register_bytes = 16u * sizeof(uint32_t);
-static constexpr uint32_t max_scheduled_cycle_change_records = 256u;
+static constexpr uint32_t max_scheduled_cycle_change_records = 4096u;
 static constexpr size_t exec_clock_hit_record_bytes = 12u * sizeof(uint32_t);
 static constexpr size_t exec_cycle_change_record_bytes = 17u * sizeof(uint32_t);
 
