@@ -688,6 +688,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
            */
            /* ratios below 1% are considered to be dropouts due to
               temporary load imbalance, the cycles adjusting is skipped */
+        const uint32_t old_cycle_max = static_cast<uint32_t>(CPU_CycleMax);
         if (ratio > 10) {
             /* ratios below 12% along with a large time since the last update
                has taken place are most likely caused by heavy load through a
@@ -702,6 +703,16 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
             }
         }
 
+#if C_HEAVY_DEBUG
+        // Buffered execution traces keep adaptive-cycle history in a parallel
+        // in-memory sidecar; this call only records an actual divisor change.
+        if (CPU_CycleMax != old_cycle_max)
+            DEBUG_RecordBufferedExecCycleChange(old_cycle_max,
+                                                static_cast<uint32_t>(CPU_CycleMax),
+                                                ticksDone, ticksScheduled, ticksAdded,
+                                                static_cast<uint32_t>(ratio), 1u);
+#endif
+
         //Reset cycleguessing parameters.
         CPU_IODelayRemoved = 0;
         ticksDone = 0;
@@ -713,10 +724,18 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         /* ticksAdded > 15 but ticksScheduled < 5, lower the cycles
            but do not reset the scheduled/done ticks to take them into
            account during the next auto cycle adjustment */
+        const uint32_t old_cycle_max = static_cast<uint32_t>(CPU_CycleMax);
         RDTSC_rebase();
         CPU_CycleMax /= 3;
         if (CPU_CycleMax < CPU_CYCLES_LOWER_LIMIT)
             CPU_CycleMax = CPU_CYCLES_LOWER_LIMIT;
+#if C_HEAVY_DEBUG
+        if (CPU_CycleMax != old_cycle_max)
+            DEBUG_RecordBufferedExecCycleChange(old_cycle_max,
+                                                static_cast<uint32_t>(CPU_CycleMax),
+                                                ticksDone, ticksScheduled, ticksAdded,
+                                                UINT32_MAX, 2u);
+#endif
     }
 }
 

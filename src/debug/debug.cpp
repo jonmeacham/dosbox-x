@@ -2329,6 +2329,16 @@ struct ScheduledExecDump {
 	bool read_failed = false;
 	std::vector<uint8_t> records = {};
 	size_t record_bytes = 0;
+	// Parallel diagnostic stream. These rows are never appended to DXEXE001:
+	// the sidecar preserves exact clock numerator/divisor and adaptive changes.
+	std::vector<uint8_t> clock_records = {};
+	size_t clock_record_bytes = 0;
+	std::vector<uint8_t> cycle_change_records = {};
+	size_t cycle_change_record_bytes = 0;
+	uint32_t clock_hit_count = 0;
+	uint32_t cycle_change_count = 0;
+	uint32_t clock_truncation_flags = 0;
+	size_t reserved_bytes = 0;
 	bool armed = false;
 };
 
@@ -2340,6 +2350,9 @@ static size_t scheduled_exec_buffer_bytes = 0;
 static constexpr size_t max_scheduled_exec_buffer_bytes = 128u * 1024u * 1024u;
 static constexpr uint32_t max_scheduled_exec_buffer_hits = 4096u;
 static constexpr size_t exec_dump_register_bytes = 16u * sizeof(uint32_t);
+static constexpr uint32_t max_scheduled_cycle_change_records = 256u;
+static constexpr size_t exec_clock_hit_record_bytes = 12u * sizeof(uint32_t);
+static constexpr size_t exec_cycle_change_record_bytes = 17u * sizeof(uint32_t);
 
 static ScheduledExecDump *find_scheduled_exec_dump(const uint32_t id) {
 	for (auto &request : scheduled_exec_dumps)
@@ -2360,9 +2373,46 @@ static void close_scheduled_exec_dump(ScheduledExecDump &request) {
 }
 
 static void release_scheduled_exec_buffer(ScheduledExecDump &request) {
-	if (!request.buffered || request.records.empty()) return;
-	scheduled_exec_buffer_bytes -= request.records.size();
+	if (!request.buffered || request.reserved_bytes == 0) return;
+	scheduled_exec_buffer_bytes -= request.reserved_bytes;
+	request.reserved_bytes = 0;
 	request.records.clear();
+	request.clock_records.clear();
+	request.cycle_change_records.clear();
+}
+
+static bool write_exec_clock_sidecar(ScheduledExecDump &request) {
+	const size_t base_record_bytes = exec_dump_register_bytes + request.length;
+	const size_t expected_base_hits = base_record_bytes
+	                                         ? request.record_bytes / base_record_bytes
+	                                         : 0;
+	if (request.clock_hit_count != expected_base_hits ||
+	    request.clock_record_bytes !=
+	            static_cast<size_t>(request.clock_hit_count) * exec_clock_hit_record_bytes ||
+	    request.cycle_change_record_bytes !=
+	            static_cast<size_t>(request.cycle_change_count) *
+	                    exec_cycle_change_record_bytes)
+		return false;
+	const std::string clock_filename = request.filename + ".clock";
+	std::ofstream output(clock_filename, std::ios::binary | std::ios::trunc);
+	if (!output) return false;
+	// Header schema (all little-endian u32 after magic): source buffer ID,
+	// successful hit count, adaptive-change count, two row sizes, truncation
+	// flags (bit 0 hits / bit 1 adaptive changes), then payload byte lengths.
+	output.write("DXCLK001", 8);
+	write_exec_dump_u32(output, request.id);
+	write_exec_dump_u32(output, request.clock_hit_count);
+	write_exec_dump_u32(output, request.cycle_change_count);
+	write_exec_dump_u32(output, static_cast<uint32_t>(exec_clock_hit_record_bytes));
+	write_exec_dump_u32(output, static_cast<uint32_t>(exec_cycle_change_record_bytes));
+	write_exec_dump_u32(output, request.clock_truncation_flags);
+	write_exec_dump_u32(output, static_cast<uint32_t>(request.clock_record_bytes));
+	write_exec_dump_u32(output, static_cast<uint32_t>(request.cycle_change_record_bytes));
+	output.write(reinterpret_cast<const char *>(request.clock_records.data()),
+	             static_cast<std::streamsize>(request.clock_record_bytes));
+	output.write(reinterpret_cast<const char *>(request.cycle_change_records.data()),
+	             static_cast<std::streamsize>(request.cycle_change_record_bytes));
+	return static_cast<bool>(output);
 }
 
 static void flush_scheduled_exec_buffer(ScheduledExecDump &request) {
@@ -2383,6 +2433,11 @@ static void flush_scheduled_exec_buffer(ScheduledExecDump &request) {
 	if (failed) {
 		LOG_MSG("ADDEXECBUFFER failed writing '%s'",request.filename.c_str());
 		std::remove(request.filename.c_str());
+	} else if (!write_exec_clock_sidecar(request)) {
+		LOG_MSG("ADDEXECBUFFER failed writing clock sidecar '%s.clock'",
+		        request.filename.c_str());
+		std::remove(request.filename.c_str());
+		std::remove((request.filename + ".clock").c_str());
 	}
 	release_scheduled_exec_buffer(request);
 }
@@ -2392,6 +2447,78 @@ static void write_exec_buffer_u32(uint8_t *destination, const uint32_t value) {
 	destination[1] = static_cast<uint8_t>((value >> 8u) & 0xffu);
 	destination[2] = static_cast<uint8_t>((value >> 16u) & 0xffu);
 	destination[3] = static_cast<uint8_t>((value >> 24u) & 0xffu);
+}
+
+static void append_exec_buffer_u32(std::vector<uint8_t> &destination,
+	                               size_t &offset,
+	                               const uint32_t value) {
+	if (offset + sizeof(uint32_t) > destination.size()) return;
+	write_exec_buffer_u32(destination.data() + offset, value);
+	offset += sizeof(uint32_t);
+}
+
+static uint32_t exec_clock_flags(void) {
+	return (CPU_CycleAutoAdjust ? 1u : 0u) |
+	       (CPU_SkipCycleAutoAdjust ? 2u : 0u);
+}
+
+static void append_exec_clock_hit(ScheduledExecDump &request,
+	                              const uint32_t linear_ip) {
+	auto &bytes = request.clock_records;
+	size_t &offset = request.clock_record_bytes;
+	if (offset + exec_clock_hit_record_bytes > bytes.size()) {
+		request.clock_truncation_flags |= 1u;
+		return;
+	}
+	// One fixed 48-byte row per successful DXEXE001 hit. Keep raw tick and
+	// numerator/divisor inputs: PIC_FullIndex() itself is not integer-valued.
+	const uint32_t values[12] = {
+		request.clock_hit_count, linear_ip, static_cast<uint32_t>(PIC_Ticks),
+		static_cast<uint32_t>(CPU_CycleMax), static_cast<uint32_t>(CPU_CycleLeft),
+		static_cast<uint32_t>(CPU_Cycles), static_cast<uint32_t>(PIC_IRQCheck),
+		static_cast<uint32_t>(PIC_IRQCheckPending), exec_clock_flags(),
+		static_cast<uint32_t>(CPU_CyclePercUsed),
+		static_cast<uint32_t>(CPU_IODelayRemoved),
+		static_cast<uint32_t>(CPU_CycleLimit)};
+	for (const auto value : values) append_exec_buffer_u32(bytes, offset, value);
+	++request.clock_hit_count;
+}
+
+// Called only when DOSBox's host scheduler actually changes CPU_CycleMax.
+// This records a bounded adaptive-history sidecar row for active buffered
+// captures; it performs no I/O or allocation on the scheduler path.
+void DEBUG_RecordBufferedExecCycleChange(const uint32_t old_cycle_max,
+	                                    const uint32_t new_cycle_max,
+	                                    const int32_t ticks_done,
+	                                    const uint32_t ticks_scheduled,
+	                                    const uint32_t ticks_added,
+	                                    const uint32_t ratio,
+	                                    const uint32_t change_kind) {
+	for (auto &request : scheduled_exec_dumps) {
+		if (!request.buffered || !request.armed || !request.capture_enabled ||
+		    request.clock_hit_count == 0)
+			continue;
+		auto &bytes = request.cycle_change_records;
+		size_t &offset = request.cycle_change_record_bytes;
+		if (offset + exec_cycle_change_record_bytes > bytes.size()) {
+			request.clock_truncation_flags |= 2u;
+			continue;
+		}
+		// Change row: sequence,tick,old/new max,left,cycles,IRQ check/pending,
+		// auto flags,percent,removed-I/O,ticks done/scheduled/added, ratio,
+		// kind (1=ratio adjust, 2=low-work fallback), cycle limit.
+		const uint32_t values[17] = {
+			request.cycle_change_count, static_cast<uint32_t>(PIC_Ticks),
+			old_cycle_max, new_cycle_max, static_cast<uint32_t>(CPU_CycleLeft),
+			static_cast<uint32_t>(CPU_Cycles), static_cast<uint32_t>(PIC_IRQCheck),
+			static_cast<uint32_t>(PIC_IRQCheckPending), exec_clock_flags(),
+			static_cast<uint32_t>(CPU_CyclePercUsed),
+			static_cast<uint32_t>(CPU_IODelayRemoved),
+			static_cast<uint32_t>(ticks_done), ticks_scheduled, ticks_added,
+			ratio, change_kind, static_cast<uint32_t>(CPU_CycleLimit)};
+		for (const auto value : values) append_exec_buffer_u32(bytes, offset, value);
+		++request.cycle_change_count;
+	}
 }
 
 static void invalidate_scheduled_exec_dump(ScheduledExecDump &request) {
@@ -2507,6 +2634,7 @@ static void capture_scheduled_exec_dumps() {
 			auto *record = request.records.data() + request.record_bytes;
 			for (size_t word = 0; word < 16; ++word)
 				write_exec_buffer_u32(record + word * sizeof(uint32_t), registers[word]);
+			append_exec_clock_hit(request, linear_ip);
 			request.record_bytes += exec_dump_register_bytes + request.length;
 		} else {
 			for (const auto value : registers) write_exec_dump_u32(request.output,value);
@@ -3719,8 +3847,13 @@ bool ParseCommand(char* str) {
 		                  register_name == "EBP" || register_name == "ESP" ||
                           (register_name == "ANY" && register_value == 0));
 		valid = valid && ParseScheduledAddress(address_text,snapshot_address,true);
+		// Permit one exact full-RAM witness without widening the recurring
+		// capture path; its extra bytes remain charged to the shared buffer cap.
+		const uint64_t max_capture_length = buffered && max_hits == 1
+		                                           ? 8u * 1024u * 1024u
+		                                           : 65536u;
 		valid = valid && parse_number(length_text,16,length) && length >= 1 &&
-		        length <= 65536 &&
+		        length <= max_capture_length &&
 	        (max_hits * length <= (buffered ? max_scheduled_exec_buffer_bytes
 	                                         : 64u * 1024u * 1024u));
 		valid = valid && uint64_t(snapshot_address) + length <= (uint64_t(UINT32_MAX) + 1u);
@@ -3753,18 +3886,27 @@ bool ParseCommand(char* str) {
 		request.filename = filename;
 		request.buffered = buffered;
 		if (buffered) {
-			const size_t bytes = static_cast<size_t>(max_hits) *
-			                     (exec_dump_register_bytes + static_cast<size_t>(length));
+			const size_t record_bytes = static_cast<size_t>(max_hits) *
+			                             (exec_dump_register_bytes + static_cast<size_t>(length));
+			const size_t clock_bytes = static_cast<size_t>(max_hits) *
+			                           exec_clock_hit_record_bytes;
+			const size_t cycle_change_bytes =
+				static_cast<size_t>(max_scheduled_cycle_change_records) *
+				exec_cycle_change_record_bytes;
+			const size_t bytes = record_bytes + clock_bytes + cycle_change_bytes;
 			if (bytes > max_scheduled_exec_buffer_bytes - scheduled_exec_buffer_bytes) {
 				DEBUG_ShowMsg("DEBUG: ADDEXECBUFFER memory budget exceeded.\n");
 				return true;
 			}
 			try {
-				request.records.resize(bytes);
+				request.records.resize(record_bytes);
+				request.clock_records.resize(clock_bytes);
+				request.cycle_change_records.resize(cycle_change_bytes);
 			} catch (const std::bad_alloc &) {
 				DEBUG_ShowMsg("DEBUG: ADDEXECBUFFER allocation failed.\n");
 				return true;
 			}
+			request.reserved_bytes = bytes;
 			scheduled_exec_buffer_bytes += bytes;
 		}
 		const auto id = request.id;
@@ -5223,7 +5365,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 		DEBUG_ShowMsg("ADDEXECDUMP delay duration ip reg value hits s:o len file - Capture matched instruction state.\n");
-		DEBUG_ShowMsg("ADDEXECBUFFER delay duration ip reg value hits s:o len file - Buffer up to 1000 hits within 1 MiB; flush later.\n");
+		DEBUG_ShowMsg("ADDEXECBUFFER delay duration ip reg value hits s:o len file - Buffer up to 4096 hits within shared 128 MiB; one hit may snapshot up to 8 MiB; flush later.\n");
 		DEBUG_ShowMsg("FLUSHEXECBUFFER id - Flush and release one buffered execution trace.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");

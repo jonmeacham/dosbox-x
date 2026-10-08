@@ -34,4 +34,11 @@ extern Bitu debugCallback;
 #ifdef C_HEAVY_DEBUG
 bool DEBUG_HeavyIsBreakpoint(void);
 void DEBUG_HeavyWriteLogInstruction(void);
+void DEBUG_RecordBufferedExecCycleChange(uint32_t old_cycle_max,
+	                                     uint32_t new_cycle_max,
+	                                     int32_t ticks_done,
+	                                     uint32_t ticks_scheduled,
+	                                     uint32_t ticks_added,
+	                                     uint32_t ratio,
+	                                     uint32_t change_kind);
 #endif

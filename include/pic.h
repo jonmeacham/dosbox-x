@@ -45,6 +45,7 @@ void PIC_Set_IRQ_hack(int IRQ,unsigned int hack);
 unsigned int PIC_parse_IRQ_hack_string(const char *str);
 
 extern Bitu PIC_IRQCheck;
+extern Bitu PIC_IRQCheckPending;
 extern Bitu PIC_Ticks;
 
 #if defined(HAS_LONG_DOUBLE)
