@@ -2370,7 +2370,7 @@ static size_t scheduled_exec_buffer_bytes = 0;
 // Bounded combat-object witnesses retain several descriptor ranges per paint.
 // Share this budget across all streams; buffers still allocate only on arming.
 static constexpr size_t max_scheduled_exec_buffer_bytes = 128u * 1024u * 1024u;
-static constexpr uint32_t max_scheduled_exec_buffer_hits = 4096u;
+static constexpr uint32_t max_scheduled_exec_buffer_hits = 65536u;
 static constexpr size_t exec_dump_register_bytes = 16u * sizeof(uint32_t);
 static constexpr uint32_t max_scheduled_cycle_change_records = 4096u;
 static constexpr size_t exec_clock_hit_record_bytes = 12u * sizeof(uint32_t);
@@ -5502,7 +5502,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 		DEBUG_ShowMsg("ADDEXECDUMP delay duration ip reg value hits s:o len file - Capture matched instruction state.\n");
-		DEBUG_ShowMsg("ADDEXECBUFFER delay duration ip reg value hits s:o len file - Buffer up to 4096 hits within shared 128 MiB; one hit may snapshot up to 8 MiB; flush later.\n");
+		DEBUG_ShowMsg("ADDEXECBUFFER delay duration ip reg value hits s:o len file - Buffer up to 65536 hits within shared 128 MiB; one hit may snapshot up to 8 MiB; flush later.\n");
 		DEBUG_ShowMsg("FLUSHEXECBUFFER id - Flush and release one buffered execution trace.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
