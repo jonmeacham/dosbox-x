@@ -82,6 +82,9 @@ extern unsigned int CPU_PrefetchQueueSize;
 typedef Bits (CPU_Decoder)(void);
 extern CPU_Decoder * cpudecoder;
 
+/* Active decoder: 0 = non-dynamic, 1 = dynamic x86, 2 = dynrec. */
+int CPU_IsDynamicCore(void);
+
 Bits CPU_Core_Normal_Run(void);
 Bits CPU_Core_Normal_Trap_Run(void);
 Bits CPU_Core_Simple_Run(void);

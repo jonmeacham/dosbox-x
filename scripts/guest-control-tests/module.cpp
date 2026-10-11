@@ -4,6 +4,9 @@
 #include <utility>
 #include <tuple>
 static double ticks = 0;
+static int dynamic_core = 0;
+static size_t dynamic_core_reads = 0;
+int CPU_IsDynamicCore(void) { ++dynamic_core_reads; return dynamic_core; }
 static std::vector<std::tuple<double,PIC_EventHandler,Bitu>> queue;
 static std::vector<std::pair<KBD_KEYS,bool>> keys;
 static std::vector<std::pair<int,bool>> buttons;
@@ -108,27 +111,51 @@ int main(int argc,char **argv) {
     dumpfd=open((dir+"/bytes.bin").c_str(),O_RDONLY);assert(read(dumpfd,data,4)==4&&data[0]==16);close(dumpfd);assert(access((dir+"/bad.bin").c_str(),F_OK)!=0);
     send_text(fd,"RNG SEED 0 752162d1\n"); advance(12);
     assert(writes.back()==std::make_pair(LinearPt(0x2bafa4),uint32_t(0x752162d1)));
+    GuestControl_Poll(); drain(fd);
     send_text(fd,"cpu state 0\n"); advance(12); GuestControl_Poll();
     const auto cpu_reply=drain(fd); assert(cpu_reply.find("\"eip\":472776")!=std::string::npos);
     assert(cpu_reply.find("\"linear\":2025160")!=std::string::npos);
     assert(cpu_reply.find("\"stack\":[")!=std::string::npos);
+    assert(cpu_reply.find("\"dynamicCore\":0")!=std::string::npos);
+    // Sample the active decoder when the event executes, not when queued.
+    // Preserve every CPU_IsDynamicCore value; a hardcoded normal core must fail.
+    const auto writes_before_cpu = writes.size();
+    for (int core = 1; core <= 2; ++core) {
+        dynamic_core = 0;
+        const auto reads_before_cpu = dynamic_core_reads;
+        send_text(fd,"CPU STATE 5\n");
+        assert(dynamic_core_reads == reads_before_cpu);
+        assert(drain(fd).find("\"cpu\":") == std::string::npos);
+        dynamic_core = core;
+        advance(ticks + 5); GuestControl_Poll();
+        const auto reply = drain(fd);
+        assert(reply.find("\"status\":\"done\"") != std::string::npos);
+        assert(reply.find("\"pid\":" + std::to_string(getpid())) != std::string::npos);
+        assert(reply.find("\"dynamicCore\":" + std::to_string(core)) != std::string::npos);
+        assert(dynamic_core_reads == reads_before_cpu + 1);
+    }
+    assert(writes.size() == writes_before_cpu);
+    // Core changes do not carry forward into subsequent receipts.
+    dynamic_core = 0;
+    send_text(fd,"CPU STATE 0\n"); advance(ticks); GuestControl_Poll();
+    assert(drain(fd).find("\"dynamicCore\":0") != std::string::npos);
     send_text(fd,"MOUSE MOVE 50 7 8\n"); const auto old_session=s.session; close(fd);GuestControl_Poll();
-    fd=connect_client(path); assert(s.session!=old_session); advance(62); GuestControl_Poll();assert(drain(fd).empty());assert(moves.back()==std::make_pair(7,8));
+    fd=connect_client(path); assert(s.session!=old_session); advance(72); GuestControl_Poll();assert(drain(fd).empty());assert(moves.back()==std::make_pair(7,8));
     // Queue cap rejects additional work without dropping accepted events.
     drain(fd);
     for (unsigned i=0;i<MAX_PENDING;++i) schedule("MOUSE MOVE 1000 0 0");
     assert(s.events.size()==MAX_PENDING);
     schedule("MOUSE MOVE 1000 1 1"); assert(s.events.size()==MAX_PENDING);
-    advance(1062); assert(s.events.empty());
+    advance(1072); assert(s.events.empty());
     GuestControl_Poll(); drain(fd);
     // Output backpressure disconnects rather than retaining unbounded replies.
     for (unsigned i=0;i<2000;++i) schedule("invalid");
     assert(s.client<0 && s.output_bytes==0 && s.output.empty());
     close(fd); fd=connect_client(path); assert(drain(fd).empty());
-    send_text(fd,"KEY 0 100 a\nMOUSE BUTTON 0 middle press\n"); advance(1062);assert(!s.pressed_keys.empty());
+    send_text(fd,"KEY 0 100 a\nMOUSE BUTTON 0 middle press\n"); advance(1072);assert(!s.pressed_keys.empty());
     s.next=uint64_t(std::numeric_limits<Bitu>::max());
     const size_t pending_before=s.events.size();
     schedule("MOUSE MOVE 0 3 4"); assert(s.failed && s.events.size()==pending_before);
     GuestControl_Poll();assert(queue.empty()&&s.events.empty());assert(keys.back()==std::make_pair(KBD_a,false));assert(buttons.back()==std::make_pair(2,false));assert(access(path.c_str(),F_OK)!=0);close(fd);
-    std::cout<<"PASS: actual C++ parser, shared key alphabet, relative/absolute pointer callbacks, socket framing, dump integrity, scoped RNG seed, reconnect isolation, shutdown\n";
+    std::cout<<"PASS: actual C++ parser, shared key alphabet, relative/absolute pointer callbacks, socket framing, dump integrity, scoped RNG seed, live CPU core telemetry (0/1/2), reconnect isolation, shutdown\n";
 }

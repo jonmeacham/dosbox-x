@@ -41,6 +41,7 @@ struct Event {
     std::string command, file;
     uint32_t cpu_cs = 0, cpu_eip = 0, cpu_linear = 0;
     uint32_t cpu_ss = 0, cpu_esp = 0;
+    int cpu_dynamic_core = 0;
     std::vector<uint32_t> cpu_stack;
     size_t keyboard_space = 0;
 };
@@ -104,6 +105,7 @@ void record(const Event &e, const char *status, const char *reason = "")
             << ",\"linear\":" << e.cpu_linear
             << ",\"ss\":" << e.cpu_ss
             << ",\"esp\":" << e.cpu_esp
+            << ",\"dynamicCore\":" << e.cpu_dynamic_core
             << ",\"stack\":[";
         for (size_t i = 0; i < e.cpu_stack.size(); ++i) {
             if (i) out << ',';
@@ -267,6 +269,7 @@ void callback(Bitu value)
             error = "write";
         break;
     case Event::CpuState: {
+        e.cpu_dynamic_core = CPU_IsDynamicCore();
         e.cpu_cs = SegValue(cs);
         e.cpu_eip = reg_eip;
         e.cpu_linear = uint32_t(SegPhys(cs) + reg_eip);
