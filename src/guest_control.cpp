@@ -46,6 +46,8 @@ struct Event {
     std::string command, file;
     uint32_t cpu_cs = 0, cpu_eip = 0, cpu_linear = 0;
     uint32_t cpu_ss = 0, cpu_esp = 0;
+    bool cpu_frames = false;
+    uint32_t cpu_ebp = 0, cpu_stack_linear = 0, cpu_frame_linear = 0;
     int cpu_dynamic_core = 0;
     std::vector<uint32_t> cpu_stack;
     size_t keyboard_space = 0;
@@ -115,11 +117,24 @@ void record(const Event &e, const char *status, const char *reason = "")
             << ",\"ss\":" << e.cpu_ss
             << ",\"esp\":" << e.cpu_esp
             << ",\"stack\":[";
-        for (size_t i = 0; i < e.cpu_stack.size(); ++i) {
+        for (size_t i = 0; i < std::min(size_t(128), e.cpu_stack.size()); ++i) {
             if (i) out << ',';
             out << e.cpu_stack[i];
         }
-        out << "]}";
+        out << "]";
+        if (e.cpu_frames) {
+            out << ",\"frameSnapshot\":{\"schema\":\"native-active-frames/v1\""
+                << ",\"ebp\":" << e.cpu_ebp
+                << ",\"linearESP\":" << e.cpu_stack_linear
+                << ",\"linearEBP\":" << e.cpu_frame_linear
+                << ",\"words\":[";
+            for (size_t i = 0; i < e.cpu_stack.size(); ++i) {
+                if (i) out << ',';
+                out << e.cpu_stack[i];
+            }
+            out << "]}";
+        }
+        out << "}";
     }
     if (e.kind == Event::Key && (!strcmp(status, "pressed") || !strcmp(status, "done")))
         out << ",\"keyboardBufferSpace\":" << e.keyboard_space;
@@ -197,9 +212,11 @@ bool parse(const std::string &line, Event &e)
             uint64_t(x) > uint64_t(std::numeric_limits<uint32_t>::max()))
             return false;
         e.kind = Event::Seed; e.seed = uint32_t(x);
-    } else if (t.size() == 3 && verb == "cpu" && ascii_lower(t[1]) == "state") {
+    } else if ((t.size() == 3 || (t.size() == 4 && ascii_lower(t[3]) == "frames")) &&
+               verb == "cpu" && ascii_lower(t[1]) == "state") {
         if (!number(t[2], delay) || delay < 0 || delay > MAX_DELAY) return false;
         e.kind = Event::CpuState;
+        e.cpu_frames = t.size() == 4;
     } else if (t.size() == 3 && verb == "debug" && ascii_lower(t[1]) == "pause") {
 #if C_DEBUG
         if (!number(t[2], delay) || delay != 0) return false;
@@ -291,8 +308,16 @@ void callback(Bitu value)
         e.cpu_ss = SegValue(ss);
         e.cpu_esp = reg_esp;
         const LinearPt stack = LinearPt(SegPhys(ss) + reg_esp);
-        e.cpu_stack.reserve(128);
-        for (uint32_t i = 0; i < 128; ++i) {
+        if (e.cpu_frames) {
+            // The event reads registers and this bounded stack without executing
+            // a guest instruction between them. It is not a universal backtrace.
+            e.cpu_ebp = reg_ebp;
+            e.cpu_stack_linear = uint32_t(stack);
+            e.cpu_frame_linear = uint32_t(SegPhys(ss) + reg_ebp);
+        }
+        const uint32_t words = e.cpu_frames ? 1024u : 128u;
+        e.cpu_stack.reserve(words);
+        for (uint32_t i = 0; i < words; ++i) {
             uint32_t value = 0;
             if (mem_readd_checked(stack + i * 4, &value)) {
                 error = "read";
