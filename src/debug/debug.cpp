@@ -2538,9 +2538,11 @@ static void capture_scheduled_exec_dump_regs() {
 			continue;
 		}
 		FillFlags();
-		write_exec_dump_f64(request.output,static_cast<double>(PIC_FullIndex()));
+		const double pic_index = static_cast<double>(PIC_FullIndex());
+		write_exec_dump_f64(request.output,pic_index);
 		write_exec_dump_u32(request.output,address);
 		write_exec_dump_u32(request.output,segment_base);
+		write_exec_dump_u32(request.output,static_cast<uint32_t>(pic_index));
 		write_exec_dump_u32(request.output,linear_ip);
 		write_exec_dump_u32(request.output,reg_eip);
 		write_exec_dump_u32(request.output,reg_eax);
@@ -5404,7 +5406,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 		DEBUG_ShowMsg("ADDEXECDUMP delay duration ip reg value hits s:o len file - Capture matched instruction state.\n");
-	DEBUG_ShowMsg("ADDEXECDUMPREG delay duration ip matchReg value hits segment baseReg signedOffset len file - Capture register-relative state.\n");
+		DEBUG_ShowMsg("ADDEXECDUMPREG delay duration ip matchReg value hits segment baseReg signedOffset len file - Capture register-relative state.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
 		DEBUG_ShowMsg("OUT[P|W|D] [port] [data]  - I/O port write byte/word/dword.\n");
