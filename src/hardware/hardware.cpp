@@ -363,6 +363,8 @@ static struct {
         FILE *pic_trace;
         bool pic_trace_failed;
         unsigned long long pic_trace_ordinal;
+        std::string pic_trace_final_path;
+        std::string pic_trace_temporary_path;
         std::map<std::string,unsigned long long> pic_frame_offsets;
     } multitrack_wave = {};
 	struct {
@@ -425,19 +427,33 @@ static void CaptureMTWavePICClose(bool complete) {
                 avi_frames = avi_stream->sample_write_offset / (2 * 2);
             }
         }
-        if (fprintf(file, "end,%llu,%s,%llu,%u,2,0,%llu,%.17g,%llu,%.17g,%llu,%llu,%llu,%s\n",
+        if (fprintf(file, "end,%llu,%s,%llu,%u,2,%u,0,%llu,%.17g,%llu,%.17g,%llu,%llu,%llu,%s\n",
                     capture.multitrack_wave.pic_trace_ordinal++, it->first.c_str(),
                     (unsigned long long)stream_index, (unsigned int)capture.multitrack_wave.audiorate,
-                    it->second, (double)PIC_FullIndex(), (unsigned long long)PIC_Ticks,
+                    (unsigned int)capture.multitrack_wave.audiorate, it->second,
+                    (double)PIC_FullIndex(), (unsigned long long)PIC_Ticks,
                     (double)PIC_TickIndex(), mixer_sample_counter, chunks, avi_frames,
                     (complete && !capture.multitrack_wave.pic_trace_failed && it->second == avi_frames) ? "complete" : "incomplete") < 0 || fflush(file) != 0) {
             CaptureMTWavePICFailure("footer write");
             break;
         }
     }
-    if (fclose(file) != 0)
+    bool promote = complete && !capture.multitrack_wave.pic_trace_failed;
+    if (fclose(file) != 0) {
         CaptureMTWavePICFailure("close");
+        promote = false;
+    }
     capture.multitrack_wave.pic_trace = NULL;
+    if (promote && !capture.multitrack_wave.pic_trace_failed) {
+        if (rename(capture.multitrack_wave.pic_trace_temporary_path.c_str(),
+                   capture.multitrack_wave.pic_trace_final_path.c_str()) != 0) {
+            CaptureMTWavePICFailure("promote sidecar");
+        } else {
+            LOG_MSG("Completed multitrack PIC sidecar: %s", capture.multitrack_wave.pic_trace_final_path.c_str());
+        }
+    } else {
+        LOG_MSG("Multitrack PIC sidecar retained as incomplete: %s", capture.multitrack_wave.pic_trace_temporary_path.c_str());
+    }
 }
 
 static void CaptureMTWavePICOpen(const std::string &avi_path) {
@@ -447,14 +463,15 @@ static void CaptureMTWavePICOpen(const std::string &avi_path) {
     if (!CaptureMTWavePICEnabled())
         return;
 
-    std::string sidecar_path = avi_path + ".pic.csv";
-    capture.multitrack_wave.pic_trace = fopen(sidecar_path.c_str(), "w");
+    capture.multitrack_wave.pic_trace_final_path = avi_path + ".pic.csv";
+    capture.multitrack_wave.pic_trace_temporary_path = capture.multitrack_wave.pic_trace_final_path + ".partial";
+    capture.multitrack_wave.pic_trace = fopen(capture.multitrack_wave.pic_trace_temporary_path.c_str(), "w");
     if (capture.multitrack_wave.pic_trace == NULL) {
         CaptureMTWavePICFailure("open");
         return;
     }
     FILE *file = capture.multitrack_wave.pic_trace;
-    if (fprintf(file, "# schema=dosbox-x-multitrack-pic-v1; offsets reset when AVI writer opens; rows follow successful AVI chunk writes\nrecord_type,ordinal,stream_name,avi_stream_index,sample_rate_hz,channels,frame_offset,frame_count,pic_full_index_ms,pic_ticks,pic_tick_index,mixer_sample_frame,avi_chunk_count,avi_frame_count,status\n") < 0 || fflush(file) != 0)
+    if (fprintf(file, "# schema=dosbox-x-multitrack-pic-v1; offsets reset when AVI writer opens; PIC values are chunk submission epochs; only fully closed traces are promoted\nrecord_type,ordinal,stream_name,avi_stream_index,avi_sample_rate_hz,channels,source_sample_rate_hz,frame_offset,frame_count,pic_full_index_ms,pic_ticks,pic_tick_index,mixer_sample_frame,avi_chunk_count,avi_frame_count,status\n") < 0 || fflush(file) != 0)
         CaptureMTWavePICFailure("header write");
     for (std::map<std::string,size_t>::const_iterator it = capture.multitrack_wave.name_to_stream_index.begin();
          it != capture.multitrack_wave.name_to_stream_index.end(); ++it)
@@ -1874,12 +1891,15 @@ void CAPTURE_MultiTrackAddWave(uint32_t freq, uint32_t len, int16_t * data,const
                     if (capture.multitrack_wave.pic_trace != NULL) {
                         const unsigned long long offset = capture.multitrack_wave.pic_frame_offsets[name];
                         const char *record_type = avi_written ? "chunk" : "avi_rejected";
-                        const char *status = avi_written ? "" : "avi_write_failed";
+                        const char *status = !avi_written ? "avi_write_failed" :
+                            (freq == capture.multitrack_wave.audiorate ? "" : "source_rate_mismatch");
+                        if (avi_written && freq != capture.multitrack_wave.audiorate)
+                            CaptureMTWavePICFailure("source rate changed during capture");
                         const int written = fprintf(capture.multitrack_wave.pic_trace,
-                            "%s,%llu,%s,%llu,%u,2,%llu,%u,%.17g,%llu,%.17g,%llu,,,%s\n",
+                            "%s,%llu,%s,%llu,%u,2,%u,%llu,%u,%.17g,%llu,%.17g,%llu,,,%s\n",
                             record_type, capture.multitrack_wave.pic_trace_ordinal++, name,
                             (unsigned long long)index, (unsigned int)capture.multitrack_wave.audiorate,
-                            offset, (unsigned int)len, (double)PIC_FullIndex(),
+                            (unsigned int)freq, offset, (unsigned int)len, (double)PIC_FullIndex(),
                             (unsigned long long)PIC_Ticks, (double)PIC_TickIndex(), mixer_sample_counter, status);
                         if (avi_written)
                             capture.multitrack_wave.pic_frame_offsets[name] = offset + len;
