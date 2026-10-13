@@ -2323,7 +2323,26 @@ struct ScheduledExecDump {
 	bool armed = false;
 };
 
+/* ADDEXECDUMPREG keeps the legacy DXEXE001 command and format untouched. */
+struct ScheduledExecDumpRegs {
+	uint32_t id = 0;
+	uint32_t linear_ip = 0;
+	uint32_t match_value = 0;
+	uint32_t length = 0;
+	uint32_t max_hits = 0;
+	uint32_t hits = 0;
+	uint32_t match_reg_id = 0;
+	uint32_t base_reg_id = 0;
+	uint32_t segment_id = 0;
+	int32_t signed_offset = 0;
+	std::string match_reg = {};
+	std::string filename = {};
+	std::ofstream output = {};
+	bool armed = false;
+};
+
 static std::list<ScheduledExecDump> scheduled_exec_dumps = {};
+static std::list<ScheduledExecDumpRegs> scheduled_exec_dump_regs = {};
 static uint32_t next_scheduled_exec_dump_id = 1;
 
 static ScheduledExecDump *find_scheduled_exec_dump(const uint32_t id) {
@@ -2338,6 +2357,24 @@ static void write_exec_dump_u32(std::ofstream &output, const uint32_t value) {
 	                       static_cast<char>((value >> 16u) & 0xffu),
 	                       static_cast<char>((value >> 24u) & 0xffu)};
 	output.write(bytes,4);
+}
+
+static void write_exec_dump_u64(std::ofstream &output, const uint64_t value) {
+	const char bytes[8] = {static_cast<char>(value & 0xffu),
+	                       static_cast<char>((value >> 8u) & 0xffu),
+	                       static_cast<char>((value >> 16u) & 0xffu),
+	                       static_cast<char>((value >> 24u) & 0xffu),
+	                       static_cast<char>((value >> 32u) & 0xffu),
+	                       static_cast<char>((value >> 40u) & 0xffu),
+	                       static_cast<char>((value >> 48u) & 0xffu),
+	                       static_cast<char>((value >> 56u) & 0xffu)};
+	output.write(bytes,8);
+}
+
+static void write_exec_dump_f64(std::ofstream &output, const double value) {
+	uint64_t bits = 0;
+	memcpy(&bits,&value,sizeof(bits));
+	write_exec_dump_u64(output,bits);
 }
 
 static void close_scheduled_exec_dump(ScheduledExecDump &request) {
@@ -2376,6 +2413,165 @@ static void delayed_exec_dump_arm(Bitu opaque) {
 		return;
 	}
 	request->armed = true;
+}
+
+static ScheduledExecDumpRegs *find_scheduled_exec_dump_regs(const uint32_t id) {
+	for (auto &request : scheduled_exec_dump_regs)
+		if (request.id == id) return &request;
+	return nullptr;
+}
+
+static bool finish_scheduled_exec_dump_regs(
+		ScheduledExecDumpRegs &request, const uint32_t reason) {
+	request.output.write("DXEND002",8);
+	write_exec_dump_u32(request.output,reason);
+	write_exec_dump_u32(request.output,request.hits);
+	write_exec_dump_f64(request.output,static_cast<double>(PIC_FullIndex()));
+	request.output.flush();
+	bool complete = request.output.good();
+	request.output.close();
+	complete = complete && !request.output.fail();
+	if (!complete) {
+		LOG_MSG("ADDEXECDUMPREG failed finalizing '%s'",request.filename.c_str());
+		std::remove(request.filename.c_str());
+	}
+	return complete;
+}
+
+static void delayed_exec_dump_regs_arm(Bitu opaque) {
+	const auto id = static_cast<uint32_t>(opaque);
+	auto *request = find_scheduled_exec_dump_regs(id);
+	if (!request) return;
+	request->output.open(request->filename,std::ios::binary | std::ios::trunc);
+	if (!request->output) {
+		LOG_MSG("ADDEXECDUMPREG failed to open '%s'",request->filename.c_str());
+		scheduled_exec_dump_regs.remove_if([id](const ScheduledExecDumpRegs &item) {
+			return item.id == id;
+		});
+		return;
+	}
+	request->output.write("DXEXE002",8);
+	write_exec_dump_u32(request->output,request->base_reg_id);
+	write_exec_dump_u32(request->output,request->segment_id);
+	write_exec_dump_u32(request->output,static_cast<uint32_t>(request->signed_offset));
+	write_exec_dump_u32(request->output,request->length);
+	write_exec_dump_u32(request->output,request->linear_ip);
+	write_exec_dump_u32(request->output,request->max_hits);
+	if (!request->output) {
+		LOG_MSG("ADDEXECDUMPREG failed writing header for '%s'",
+		        request->filename.c_str());
+		request->output.close();
+		std::remove(request->filename.c_str());
+		scheduled_exec_dump_regs.remove_if([id](const ScheduledExecDumpRegs &item) {
+			return item.id == id;
+		});
+		return;
+	}
+	request->armed = true;
+}
+
+static void delayed_exec_dump_regs_timeout(Bitu opaque) {
+	const auto id = static_cast<uint32_t>(opaque);
+	auto *request = find_scheduled_exec_dump_regs(id);
+	if (!request) return;
+	if (request->armed) finish_scheduled_exec_dump_regs(*request,1);
+	scheduled_exec_dump_regs.remove_if([id](const ScheduledExecDumpRegs &item) {
+		return item.id == id;
+	});
+}
+
+static uint32_t scheduled_exec_dump_regs_register_value(const uint32_t id) {
+	switch (id) {
+	case 0: return reg_eax;
+	case 1: return reg_ebx;
+	case 2: return reg_ecx;
+	case 3: return reg_edx;
+	case 4: return reg_esi;
+	case 5: return reg_edi;
+	case 6: return reg_ebp;
+	default: return reg_esp;
+	}
+}
+
+static void capture_scheduled_exec_dump_regs() {
+	if (scheduled_exec_dump_regs.empty()) return;
+	const uint32_t linear_ip = static_cast<uint32_t>(SegPhys(cs) + reg_eip);
+	for (auto it = scheduled_exec_dump_regs.begin();
+	     it != scheduled_exec_dump_regs.end();) {
+		auto &request = *it;
+		if (!request.armed || request.linear_ip != linear_ip ||
+		    (request.match_reg != "ANY" && request.match_value !=
+		     scheduled_exec_dump_regs_register_value(request.match_reg_id))) {
+			++it;
+			continue;
+		}
+		const uint64_t segment_base_value = request.segment_id == 0 ? 0u
+		        : static_cast<uint64_t>(SegPhys(request.segment_id == 1 ? ds : ss));
+		if (segment_base_value > UINT32_MAX) {
+			finish_scheduled_exec_dump_regs(request,4);
+			it = scheduled_exec_dump_regs.erase(it);
+			continue;
+		}
+		const uint32_t segment_base = static_cast<uint32_t>(segment_base_value);
+		const int64_t resolved = static_cast<int64_t>(segment_base_value) +
+		        static_cast<int64_t>(scheduled_exec_dump_regs_register_value(
+		                request.base_reg_id)) + request.signed_offset;
+		if (resolved < 0 || resolved > static_cast<int64_t>(UINT32_MAX) ||
+		    static_cast<uint64_t>(resolved) + request.length >
+		            (static_cast<uint64_t>(UINT32_MAX) + 1u)) {
+			finish_scheduled_exec_dump_regs(request,4);
+			it = scheduled_exec_dump_regs.erase(it);
+			continue;
+		}
+		const uint32_t address = static_cast<uint32_t>(resolved);
+		std::vector<uint8_t> bytes(request.length);
+		bool failed = false;
+		for (uint32_t offset = 0; offset < request.length; ++offset) {
+			if (mem_readb_checked(static_cast<PhysPt>(address + offset),&bytes[offset])) {
+				failed = true;
+				break;
+			}
+		}
+		if (failed) {
+			finish_scheduled_exec_dump_regs(request,3);
+			it = scheduled_exec_dump_regs.erase(it);
+			continue;
+		}
+		FillFlags();
+		write_exec_dump_f64(request.output,static_cast<double>(PIC_FullIndex()));
+		write_exec_dump_u32(request.output,address);
+		write_exec_dump_u32(request.output,segment_base);
+		write_exec_dump_u32(request.output,linear_ip);
+		write_exec_dump_u32(request.output,reg_eip);
+		write_exec_dump_u32(request.output,reg_eax);
+		write_exec_dump_u32(request.output,reg_ebx);
+		write_exec_dump_u32(request.output,reg_ecx);
+		write_exec_dump_u32(request.output,reg_edx);
+		write_exec_dump_u32(request.output,reg_esi);
+		write_exec_dump_u32(request.output,reg_edi);
+		write_exec_dump_u32(request.output,reg_ebp);
+		write_exec_dump_u32(request.output,reg_esp);
+		write_exec_dump_u32(request.output,reg_flags);
+		write_exec_dump_u32(request.output,SegValue(cs));
+		write_exec_dump_u32(request.output,SegValue(ds));
+		write_exec_dump_u32(request.output,SegValue(es));
+		write_exec_dump_u32(request.output,SegValue(ss));
+		request.output.write(reinterpret_cast<const char *>(bytes.data()),
+		                     static_cast<std::streamsize>(bytes.size()));
+		if (!request.output) {
+			LOG_MSG("ADDEXECDUMPREG failed writing '%s'",request.filename.c_str());
+			request.output.close();
+			std::remove(request.filename.c_str());
+			it = scheduled_exec_dump_regs.erase(it);
+			continue;
+		}
+		if (++request.hits >= request.max_hits) {
+			finish_scheduled_exec_dump_regs(request,2);
+			it = scheduled_exec_dump_regs.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 static void delayed_exec_dump_timeout(Bitu opaque) {
@@ -3681,6 +3877,115 @@ bool ParseCommand(char* str) {
 		PIC_AddEvent(&delayed_exec_dump_timeout,
 		             static_cast<double>(delay + duration),id);
 		DEBUG_ShowMsg("DEBUG: Queued guest-clock execution dump.\n");
+		return true;
+	}
+
+	if (command == "ADDEXECDUMPREG") {
+		std::istringstream original_stream(original_str);
+		std::string original_command, delay_text, duration_text, ip_text;
+		std::string match_reg, match_value_text, hits_text, segment_text;
+		std::string base_reg_text, offset_text, length_text, filename, trailing;
+		original_stream >> original_command >> delay_text >> duration_text >> ip_text
+		                >> match_reg >> match_value_text >> hits_text >> segment_text
+		                >> base_reg_text >> offset_text >> length_text >> filename;
+		bool valid = !original_stream.fail() && !(original_stream >> trailing);
+		uint64_t delay = 0, duration = 0, linear_ip = 0, match_value = 0;
+		uint64_t max_hits = 0, length = 0;
+		int64_t signed_offset = 0;
+		auto parse_unsigned = [](const std::string &text, const int base,
+		                        uint64_t &value) {
+			if (text.empty() || text.front() == '-' || text.front() == '+') return false;
+			try {
+				size_t used = 0;
+				value = std::stoull(text,&used,base);
+				return used == text.size();
+			} catch (...) {
+				return false;
+			}
+		};
+		valid = valid && parse_unsigned(delay_text,10,delay) && delay <= 600000;
+		valid = valid && parse_unsigned(duration_text,10,duration) && duration >= 1 &&
+		        duration <= 600000;
+		valid = valid && parse_unsigned(ip_text,16,linear_ip) && linear_ip <= UINT32_MAX;
+		valid = valid && parse_unsigned(match_value_text,16,match_value) &&
+		        match_value <= UINT32_MAX;
+		valid = valid && parse_unsigned(hits_text,10,max_hits) && max_hits >= 1 &&
+		        max_hits <= 4096;
+		valid = valid && (match_reg == "ANY" || match_reg == "EAX" ||
+		                  match_reg == "EBX" || match_reg == "ECX" ||
+		                  match_reg == "EDX" || match_reg == "ESI" ||
+		                  match_reg == "EDI" || match_reg == "EBP" ||
+		                  match_reg == "ESP");
+		valid = valid && (match_reg != "ANY" || match_value == 0);
+		uint32_t base_reg_id = 0;
+		if (base_reg_text == "EAX") base_reg_id = 0;
+		else if (base_reg_text == "EBX") base_reg_id = 1;
+		else if (base_reg_text == "ECX") base_reg_id = 2;
+		else if (base_reg_text == "EDX") base_reg_id = 3;
+		else if (base_reg_text == "ESI") base_reg_id = 4;
+		else if (base_reg_text == "EDI") base_reg_id = 5;
+		else if (base_reg_text == "EBP") base_reg_id = 6;
+		else if (base_reg_text == "ESP") base_reg_id = 7;
+		else valid = false;
+		uint32_t match_reg_id = 0;
+		if (match_reg == "EAX") match_reg_id = 0;
+		else if (match_reg == "EBX") match_reg_id = 1;
+		else if (match_reg == "ECX") match_reg_id = 2;
+		else if (match_reg == "EDX") match_reg_id = 3;
+		else if (match_reg == "ESI") match_reg_id = 4;
+		else if (match_reg == "EDI") match_reg_id = 5;
+		else if (match_reg == "EBP") match_reg_id = 6;
+		else if (match_reg == "ESP") match_reg_id = 7;
+		uint32_t segment_id = 0;
+		if (segment_text == "LINEAR") segment_id = 0;
+		else if (segment_text == "DS") segment_id = 1;
+		else if (segment_text == "SS") segment_id = 2;
+		else valid = false;
+		try {
+			size_t used = 0;
+			signed_offset = std::stoll(offset_text,&used,10);
+			valid = valid && used == offset_text.size() &&
+			        signed_offset >= INT32_MIN && signed_offset <= INT32_MAX;
+		} catch (...) {
+			valid = false;
+		}
+		valid = valid && parse_unsigned(length_text,16,length) && length >= 1 &&
+		        length <= 65536;
+		const uint64_t total_size = 32u + max_hits * (80u + length) + 24u;
+		valid = valid && total_size <= 64u * 1024u * 1024u;
+#if !C_HEAVY_DEBUG
+		DEBUG_ShowMsg("DEBUG: ADDEXECDUMPREG requires a heavy-debug build.\n");
+		valid = false;
+#endif
+		if (cpudecoder != &CPU_Core_Normal_Run) {
+			DEBUG_ShowMsg("DEBUG: ADDEXECDUMPREG requires the normal CPU core.\n");
+			valid = false;
+		}
+		if (!valid) {
+			DEBUG_ShowMsg("DEBUG: ADDEXECDUMPREG syntax: delay-ms duration-ms "
+			              "linear-ip matchReg matchValue max-hits LINEAR|DS|SS "
+			              "baseReg(EAX..ESP) signed-decimal-offset hex-length filename.\n");
+			return true;
+		}
+		ScheduledExecDumpRegs request;
+		request.id = next_scheduled_exec_dump_id++;
+		if (request.id == 0) request.id = next_scheduled_exec_dump_id++;
+		request.linear_ip = static_cast<uint32_t>(linear_ip);
+		request.match_reg = match_reg;
+		request.match_value = static_cast<uint32_t>(match_value);
+		request.max_hits = static_cast<uint32_t>(max_hits);
+		request.match_reg_id = match_reg_id;
+		request.base_reg_id = base_reg_id;
+		request.segment_id = segment_id;
+		request.signed_offset = static_cast<int32_t>(signed_offset);
+		request.length = static_cast<uint32_t>(length);
+		request.filename = filename;
+		const auto id = request.id;
+		scheduled_exec_dump_regs.push_back(std::move(request));
+		PIC_AddEvent(&delayed_exec_dump_regs_arm,static_cast<double>(delay),id);
+		PIC_AddEvent(&delayed_exec_dump_regs_timeout,
+		             static_cast<double>(delay + duration),id);
+		DEBUG_ShowMsg("DEBUG: Queued guest-clock execution register dump.\n");
 		return true;
 	}
 
@@ -5099,6 +5404,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 		DEBUG_ShowMsg("ADDEXECDUMP delay duration ip reg value hits s:o len file - Capture matched instruction state.\n");
+	DEBUG_ShowMsg("ADDEXECDUMPREG delay duration ip matchReg value hits segment baseReg signedOffset len file - Capture register-relative state.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
 		DEBUG_ShowMsg("OUT[P|W|D] [port] [data]  - I/O port write byte/word/dword.\n");
@@ -7282,6 +7588,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		return false;
 	}
 	capture_scheduled_exec_dumps();
+	capture_scheduled_exec_dump_regs();
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
 		return true;
 	}
