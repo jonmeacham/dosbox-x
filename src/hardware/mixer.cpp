@@ -231,6 +231,14 @@ void MIXER_NativeAudioEvent(unsigned kind,const char *source,int64_t a,int64_t b
     static NativeAudioEvents trace;trace.record(kind,source,a,b);
 }
 
+bool MIXER_NativeAudioPhaseTracing() {
+    static const bool enabled = []() {
+        const char *value = getenv("DOSBOX_X_NATIVE_AUDIO_PHASE_TRACE");
+        return value && !strcmp(value,"1");
+    }();
+    return enabled;
+}
+
 void MixerChannel::UpdateVolume(void) {
     volmul[0]=(Bits)((1 << MIXER_VOLSHIFT)*scale[0]*volmain[0]);
     volmul[1]=(Bits)((1 << MIXER_VOLSHIFT)*scale[1]*volmain[1]);

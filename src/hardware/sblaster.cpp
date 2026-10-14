@@ -81,6 +81,7 @@
 #include "mixer.h"
 #include "dma.h"
 #include "pic.h"
+#include "regs.h"
 #include "bios.h"
 #include "hardware.h"
 #include "control.h"
@@ -793,6 +794,12 @@ void SB_INFO::DSP_FlushData(void) {
 // Optional ordered witness of DMA completion and guest IRQ acknowledgement.
 // Read-only snapshots: DMA controller position is distinct from guest half state.
 void SB_INFO::TraceNativeIRQ(const char *event) {
+    // Same ordered stream as mixer boundaries and execution snapshots. CPU
+    // coordinates are observations at the device callback, not an assumed
+    // guest ISR-entry/store timestamp. Guard the live opcode before deriving
+    // any driver code address from them.
+    if (MIXER_NativeAudioPhaseTracing())
+        MIXER_NativeAudioEvent(8,event,int64_t(SegValue(cs)),int64_t(reg_eip));
     struct Trace {
         FILE *file=nullptr;
         size_t bytes=0;

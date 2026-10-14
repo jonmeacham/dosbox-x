@@ -151,6 +151,12 @@ void PCSPEAKER_SetType(bool pit_clock_gate_enabled, bool pit_output_enabled);
 void PCSPEAKER_SetPITControl(Bitu mode);
 
 // Opt-in total-order native audio event evidence (not a playback API).
+// Diagnostic common-clock kinds 7/8/9: successful execution snapshot
+// (request id, zero-based hit) / SB IRQ event (observed CS, EIP) /
+// execution snapshot armed (request id, linear IP). The arm log names its file.
+// Additional phase kinds require DOSBOX_X_NATIVE_AUDIO_PHASE_TRACE=1; existing
+// event consumers retain their original stream when it is absent.
+bool MIXER_NativeAudioPhaseTracing();
 void MIXER_NativeAudioEvent(unsigned kind, const char *source, int64_t a=0, int64_t b=0);
 
 #endif
