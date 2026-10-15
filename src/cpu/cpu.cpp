@@ -19,6 +19,7 @@
 
 #include <assert.h>
 #include <cstdlib>
+#include <cmath>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -106,6 +107,7 @@ extern bool auto_determine_dynamic_core_paging;
 uint64_t rdtsc_count_base = 0;
 pic_tickindex_t rdtsc_pic_base = 0;
 
+#if C_DEBUG
 namespace {
 struct NativeCpuTraceState {
 	bool configured = false;
@@ -122,8 +124,6 @@ struct NativeCpuTraceState {
 	std::vector<OpenPair> stack;
 };
 NativeCpuTraceState native_cpu_trace;
-struct HardwareTrace { uint64_t id; CPU_TraceOrigin origin; long vector; long oldeip; };
-std::vector<HardwareTrace> hardware_trace_ids;
 
 static const char *trace_origin_name(CPU_TraceOrigin origin) {
 	switch (origin) {
@@ -145,9 +145,10 @@ static bool trace_configure(void) {
 	if (!path || !*path || !start || !*start || !end || !*end || !maxrows || !*maxrows) return false;
 	char *tail = nullptr;
 	s.start_ms = std::strtod(start, &tail);
-	if (!tail || *tail) return false;
+	if (!tail || *tail || !std::isfinite(s.start_ms) || s.start_ms < 0.0 || std::signbit(s.start_ms)) return false;
 	s.end_ms = std::strtod(end, &tail);
-	if (!tail || *tail || !(s.end_ms > s.start_ms)) return false;
+	if (!tail || *tail || !std::isfinite(s.end_ms) || s.end_ms < 0.0 || std::signbit(s.end_ms) ||
+	    !(s.end_ms > s.start_ms) || s.end_ms > 600000.0) return false;
 	const unsigned long long parsed_max = std::strtoull(maxrows, &tail, 10);
 	if (!tail || *tail || parsed_max == 0 || parsed_max > 100000ULL) return false;
 	s.max_rows = static_cast<uint64_t>(parsed_max);
@@ -190,20 +191,15 @@ static bool trace_emit(uint64_t pair_id, uint64_t parent_id, const char *kind,
 	/* Materialize lazy EFLAGS only while the observer is actively recording. */
 	FillFlags();
 	const Bitu raw_sp = reg_esp;
-	const Bitu stack_base = SegPhys(ss);
-	const Bitu stack_offset = raw_sp & cpu.stack.mask;
-	const Bitu address_max = static_cast<Bitu>(~static_cast<Bitu>(0));
-	const bool stack_address_overflow = stack_base > address_max - stack_offset;
-	const Bitu stack_address = stack_address_overflow ? 0 : stack_base + stack_offset;
+	const uint64_t stack_base = static_cast<uint64_t>(SegPhys(ss));
+	const uint64_t stack_offset = static_cast<uint64_t>(raw_sp & cpu.stack.mask);
+	const uint64_t stack_address = stack_base + stack_offset;
+	const bool stack_address_overflow = stack_address > UINT32_MAX || stack_address + 31ULL > UINT32_MAX;
 	std::string stack_hex;
 	const char *stack_status = stack_address_overflow ? "range" : "ok";
 	uint8_t bytes[32];
 	for (unsigned int i = 0; i < 32 && !stack_address_overflow; ++i) {
-		if (stack_address > static_cast<Bitu>(~static_cast<Bitu>(0)) - i) {
-			stack_status = "range";
-			break;
-		}
-		if (mem_readb_checked(stack_address + i, &bytes[i])) {
+		if (mem_readb_checked(static_cast<LinearPt>(stack_address + i), &bytes[i])) {
 			stack_status = i == 0 ? "unmapped" : "partial";
 			break;
 		}
@@ -238,16 +234,15 @@ static bool trace_emit(uint64_t pair_id, uint64_t parent_id, const char *kind,
 
 static uint64_t trace_open(const char *kind, const char *origin, long vector, long type,
 		long use32, long oldeip, bool force) {
-	trace_configure();
 	NativeCpuTraceState &s = native_cpu_trace;
+	if (!trace_configure() || !s.active) return 0;
 	const double now = trace_time_ms();
-	if (!s.active) return 0;
 	if (now >= s.end_ms) {
 		if (s.stack.empty()) trace_footer("window_end", now);
 		return 0;
 	}
 	if (std::string(kind) == "interrupt8" && !force) return 0;
-	if (now < s.start_ms || (!force && std::string(kind) == "iret" && SegValue(cs) != 0x70 && SegValue(cs) != 0x80)) return 0;
+	if (now < s.start_ms) return 0;
 	const uint64_t id = s.next_pair++;
 	const uint64_t parent = s.stack.empty() ? 0 : s.stack.back().id;
 	if (!trace_emit(id, parent, kind, "enter", origin, vector, type, use32, oldeip, "na")) return 0;
@@ -290,22 +285,16 @@ private:
 };
 }
 
-void CPU_TraceHardwareInterruptBegin(Bitu num, CPU_TraceOrigin origin) {
-	/* Every hardware call is a window-crossing observation point; only IRQ0's
-	 * remapped vector 8 is retained in the audio-focused trace. */
-	trace_configure();
-	if (!native_cpu_trace.active) return;
-	const uint64_t id = num == 8 ? trace_open("hw_interrupt", trace_origin_name(origin), (long)num, 0, -1, (long)reg_eip, true) : 0;
-	hardware_trace_ids.push_back({id, origin, (long)num, (long)reg_eip});
+uint64_t CPU_TraceHardwareInterruptBegin(Bitu num, CPU_TraceOrigin origin, uint32_t oldeip) {
+	return trace_open("hw_interrupt", trace_origin_name(origin), (long)num, 0, -1, (long)oldeip, true);
 }
 
-void CPU_TraceHardwareInterruptEnd(bool unwinding) {
-	if (hardware_trace_ids.empty()) return;
-	const HardwareTrace entry = hardware_trace_ids.back();
-	hardware_trace_ids.pop_back();
-	trace_close(entry.id, "hw_interrupt", trace_origin_name(entry.origin), entry.vector, 0, -1, entry.oldeip,
+void CPU_TraceHardwareInterruptEnd(uint64_t token, Bitu num, CPU_TraceOrigin origin,
+		uint32_t oldeip, bool unwinding) {
+	trace_close(token, "hw_interrupt", trace_origin_name(origin), (long)num, 0, -1, (long)oldeip,
 			unwinding ? "unwind" : "normal");
 }
+#endif /* C_DEBUG */
 
 bool cpu_double_fault_enable;
 bool cpu_triple_fault_reset;
@@ -1409,8 +1398,10 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
       CPU_DebugException(0,oldeip); // DR6 bits need updating
       return;
     }
+#if C_DEBUG
 	NativeCpuTraceScope trace_interrupt8("interrupt8", "na", (long)num, (long)type, -1,
 			(long)oldeip, num == 8);
+#endif
 	lastint=(uint8_t)num;
 	FillFlags();
 #if C_DEBUG
@@ -1716,8 +1707,10 @@ do_interrupt:
  *      Make sure this code emulates that bug. Some buggy games might rely on that. */
 
 void CPU_IRET(bool use32,uint32_t oldeip) {
+#if C_DEBUG
 	NativeCpuTraceScope trace_iret("iret", "na", -1, -1, use32 ? 1 : 0,
-			(long)oldeip, SegValue(cs) == 0x70 || SegValue(cs) == 0x80);
+			(long)oldeip, true);
+#endif
 	uint32_t orig_esp = reg_esp;
 
 	/* x86 CPUs consider IRET the completion of an NMI, no matter where it happens */
