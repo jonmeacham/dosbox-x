@@ -574,6 +574,7 @@ struct SB_INFO {
 	void ESSUpdateFilterFromSB(void);
 	void CTMIXER_UpdateVolumes(void);
 	void GenerateDMASound(Bitu size);
+	Bitu ReadNativeDMA(Bitu size, uint8_t *buffer, bool silent = false);
 	void sb16asp_next_RAM_byte(void);
 	void CTMIXER_Write(uint8_t val);
 	uint8_t ESS_DoRead(uint8_t reg);
@@ -922,6 +923,17 @@ void SB_INFO::SB_OnEndOfDMA(void) {
 	}
 }
 
+Bitu SB_INFO::ReadNativeDMA(Bitu size, uint8_t *buffer, bool silent) {
+    if (!MIXER_NativeDMAPayloadTracing()) return dma.chan->Read(size,buffer);
+    const char *source = silent ? "sb-silent" : "sb-dma";
+    MIXER_NativeAudioEvent(11,source,dma.chan->channum,size);
+    MIXER_NativeAudioEvent(13,"sb-format",dma.mode,
+                          (dma.stereo ? 1 : 0) | (dma.sign ? 2 : 0) | (silent ? 4 : 0));
+    const Bitu result = dma.chan->Read(size,buffer);
+    MIXER_NativeAudioEvent(12,source,dma.chan->channum,result);
+    return result;
+}
+
 void SB_INFO::GenerateDMASound(Bitu size) {
 	Bitu read=0;Bitu done=0;Bitu i=0;
 
@@ -1026,7 +1038,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 	else {
 		switch (dma.mode) {
 			case DSP_DMA_2:
-				read=dma.chan->Read(size,dma.buf.b8);
+				read=ReadNativeDMA(size,dma.buf.b8);
 				if (read && adpcm.haveref) {
 					adpcm.haveref=false;
 					adpcm.reference=dma.buf.b8[0];
@@ -1042,7 +1054,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 				chan->AddSamples_m8(done,MixTemp);
 				break;
 			case DSP_DMA_3:
-				read=dma.chan->Read(size,dma.buf.b8);
+				read=ReadNativeDMA(size,dma.buf.b8);
 				if (read && adpcm.haveref) {
 					adpcm.haveref=false;
 					adpcm.reference=dma.buf.b8[0];
@@ -1057,7 +1069,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 				chan->AddSamples_m8(done,MixTemp);
 				break;
 			case DSP_DMA_4:
-				read=dma.chan->Read(size,dma.buf.b8);
+				read=ReadNativeDMA(size,dma.buf.b8);
 				if (read && adpcm.haveref) {
 					adpcm.haveref=false;
 					adpcm.reference=dma.buf.b8[0];
@@ -1072,7 +1084,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 				break;
 			case DSP_DMA_8:
 				if (dma.stereo) {
-					read=dma.chan->Read(size,&dma.buf.b8[dma.remain_size]);
+					read=ReadNativeDMA(size,&dma.buf.b8[dma.remain_size]);
 					Bitu total=read+dma.remain_size;
 					if (!dma.sign)  chan->AddSamples_s8(total>>1,dma.buf.b8);
 					else chan->AddSamples_s8s(total>>1,(int8_t*)dma.buf.b8);
@@ -1081,7 +1093,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 						dma.buf.b8[0]=dma.buf.b8[total-1];
 					} else dma.remain_size=0;
 				} else {
-					read=dma.chan->Read(size,dma.buf.b8);
+					read=ReadNativeDMA(size,dma.buf.b8);
 					if (!dma.sign) chan->AddSamples_m8(read,dma.buf.b8);
 					else chan->AddSamples_m8s(read,(int8_t *)dma.buf.b8);
 				}
@@ -1092,7 +1104,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 					/* In DSP_DMA_16_ALIASED mode temporarily divide by 2 to get number of 16-bit
 					   samples, because 8-bit DMA Read returns byte size, while in DSP_DMA_16 mode
 					   16-bit DMA Read returns word size */
-					read=dma.chan->Read(size,(uint8_t *)&dma.buf.b16[dma.remain_size])
+					read=ReadNativeDMA(size,(uint8_t *)&dma.buf.b16[dma.remain_size])
 						>> (dma.mode==DSP_DMA_16_ALIASED ? 1:0);
 					Bitu total=read+dma.remain_size;
 #if defined(WORDS_BIGENDIAN)
@@ -1107,7 +1119,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 						dma.buf.b16[0]=dma.buf.b16[total-1];
 					} else dma.remain_size=0;
 				} else {
-					read=dma.chan->Read(size,(uint8_t *)dma.buf.b16)
+					read=ReadNativeDMA(size,(uint8_t *)dma.buf.b16)
 						>> (dma.mode==DSP_DMA_16_ALIASED ? 1:0);
 #if defined(WORDS_BIGENDIAN)
 					if (dma.sign) chan->AddSamples_m16_nonnative(read,dma.buf.b16);
@@ -3762,7 +3774,7 @@ static void DMA_Silent_Event(Bitu val) {
 		(sb[ci].dma.chan != NULL) ?
 			(sb[ci].dma.recording ?
 				sb[ci].dma.chan->Write(val,sb[ci].dma.buf.b8) :
-				sb[ci].dma.chan->Read(val,sb[ci].dma.buf.b8)
+				sb[ci].ReadNativeDMA(val,sb[ci].dma.buf.b8,true)
 			) :
 			0;
 	sb[ci].dma.left-=read;
@@ -3827,7 +3839,7 @@ static void DMA_DAC_Event(Bitu val) {
 		L = R = 0;
 	}
 	else {
-		read = sb[ci].dma.chan->Read(expct,tmp);
+		read = sb[ci].ReadNativeDMA(expct,tmp);
 		//if (read != expct)
 		//      LOG_MSG("DMA read was not sample aligned. Sound may swap channels or become static. On real hardware the same may happen unless audio is prepared specifically.\n");
 

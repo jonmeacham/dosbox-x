@@ -157,6 +157,11 @@ void PCSPEAKER_SetPITControl(Bitu mode);
 // Additional phase kinds require DOSBOX_X_NATIVE_AUDIO_PHASE_TRACE=1; existing
 // event consumers retain their original stream when it is absent.
 bool MIXER_NativeAudioPhaseTracing();
+// Optional bounded raw DMA evidence: actual mapped physical address and bytes.
+// Requires phase tracing plus DOSBOX_X_NATIVE_DMA_PAYLOADS and AUDIO_EVENTS.
+bool MIXER_NativeDMAPayloadTracing();
+void MIXER_NativeDMAPayload(uint32_t address, uint32_t unit_bytes, bool decrement,
+                           const uint8_t *data, uint32_t bytes);
 void MIXER_NativeAudioEvent(unsigned kind, const char *source, int64_t a=0, int64_t b=0);
 
 #endif

@@ -211,7 +211,9 @@ struct NativeAudioEvents {
     NativeAudioEvents() {
         const char *path=getenv("DOSBOX_X_NATIVE_AUDIO_EVENTS");
         if(path && *path) {
-            file=fopen(path,"w");
+            // Payload mode needs exclusive evidence paths: aliases must fail
+            // instead of truncating an already-open binary payload stream.
+            file=fopen(path,MIXER_NativeDMAPayloadTracing() ? "wx" : "w");
             if(file)bytes=fprintf(file,"ordinal,kind,source,pic_ticks,pic_index,a,b\n");
         }
     }
@@ -237,6 +239,74 @@ bool MIXER_NativeAudioPhaseTracing() {
         return value && !strcmp(value,"1");
     }();
     return enabled;
+}
+
+bool MIXER_NativeDMAPayloadTracing() {
+    static const bool enabled = []() {
+        const char *path = getenv("DOSBOX_X_NATIVE_DMA_PAYLOADS");
+        const char *events = getenv("DOSBOX_X_NATIVE_AUDIO_EVENTS");
+        return MIXER_NativeAudioPhaseTracing() && path && *path && events && *events &&
+               strcmp(path,events) != 0;
+    }();
+    return enabled;
+}
+
+namespace {
+struct NativeDMAPayloads {
+    FILE *file = nullptr;
+    uint32_t records = 0;
+    uint32_t payload_bytes = 0;
+    bool failed = false;
+    static bool word(FILE *out, uint32_t value) {
+        const uint8_t bytes[4] = {uint8_t(value),uint8_t(value >> 8),
+                                  uint8_t(value >> 16),uint8_t(value >> 24)};
+        return fwrite(bytes,1,4,out) == 4;
+    }
+    NativeDMAPayloads() {
+        if (!MIXER_NativeDMAPayloadTracing()) return;
+        file = fopen(getenv("DOSBOX_X_NATIVE_DMA_PAYLOADS"),"wx");
+        if (!file || fwrite("DXDMA001",1,8,file) != 8) fail();
+        else MIXER_NativeAudioEvent(14,"dma-arm",0,0);
+    }
+    void fail() {
+        failed = true;
+        LOG_MSG("Native DMA payload capture incomplete");
+        MIXER_NativeAudioEvent(14,"dma-failure",records,payload_bytes);
+        if (file) { fclose(file); file = nullptr; }
+    }
+    ~NativeDMAPayloads() {
+        if (!file) return;
+        const bool good = fwrite("DXEND001",1,8,file) == 8 &&
+                word(file,records) && word(file,payload_bytes) && word(file,0) &&
+                fflush(file) == 0;
+        if (!good) { fail(); return; }
+        if (fclose(file) != 0) {
+            file = nullptr; fail(); return;
+        }
+        file = nullptr;
+        MIXER_NativeAudioEvent(14,"dma-end",records,payload_bytes);
+    }
+    void record(uint32_t address, uint32_t unit, bool decrement,
+                const uint8_t *data, uint32_t bytes) {
+        if (!file || failed) return;
+        if (!bytes || (unit != 1 && unit != 2) || bytes % unit || bytes > 4096 ||
+            payload_bytes + bytes > 64u * 1024u * 1024u || records >= 1000000u) {
+            fail(); return;
+        }
+        const bool good = word(file,records) && word(file,address) && word(file,unit) &&
+                word(file,decrement ? 1u : 0u) && word(file,bytes) &&
+                fwrite(data,1,bytes,file) == bytes && fflush(file) == 0;
+        if (!good) { fail(); return; }
+        MIXER_NativeAudioEvent(10,"dma-payload",records,bytes);
+        ++records;
+        payload_bytes += bytes;
+    }
+};
+}
+void MIXER_NativeDMAPayload(uint32_t address, uint32_t unit_bytes, bool decrement,
+                           const uint8_t *data, uint32_t bytes) {
+    static NativeDMAPayloads trace;
+    trace.record(address,unit_bytes,decrement,data,bytes);
 }
 
 void MixerChannel::UpdateVolume(void) {
