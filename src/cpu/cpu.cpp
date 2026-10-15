@@ -246,6 +246,7 @@ static uint64_t trace_open(const char *kind, const char *origin, long vector, lo
 		if (s.stack.empty()) trace_footer("window_end", now);
 		return 0;
 	}
+	if (std::string(kind) == "interrupt8" && !force) return 0;
 	if (now < s.start_ms || (!force && std::string(kind) == "iret" && SegValue(cs) != 0x70 && SegValue(cs) != 0x80)) return 0;
 	const uint64_t id = s.next_pair++;
 	const uint64_t parent = s.stack.empty() ? 0 : s.stack.back().id;
