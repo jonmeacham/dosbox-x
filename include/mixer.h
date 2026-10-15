@@ -163,5 +163,7 @@ bool MIXER_NativeDMAPayloadTracing();
 void MIXER_NativeDMAPayload(uint32_t address, uint32_t unit_bytes, bool decrement,
                            const uint8_t *data, uint32_t bytes);
 void MIXER_NativeAudioEvent(unsigned kind, const char *source, int64_t a=0, int64_t b=0);
+// Optional FM state checkpoint after chip and OPL-mode setup; observation only.
+void MIXER_NativeFMCheckpoint(const MixerChannel *channel,uint32_t mode,uint32_t rate);
 
 #endif

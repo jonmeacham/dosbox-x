@@ -110,6 +110,9 @@ static struct {
     bool            mute;
 } mixer;
 
+extern unsigned long long mixer_sample_counter;
+extern double mixer_start_pic_time;
+
 // Opt-in state-only witness. No guest memory, samples or clocks are changed.
 namespace {
 bool nativeSBStateEnabled(const MixerChannel *channel) {
@@ -184,13 +187,120 @@ void nativeSBState(const MixerChannel *channel,uint32_t phase,uint32_t a=0,uint3
     static NativeSBStates trace;
     trace.record(channel,phase,a,b,c);
 }
-struct NativeSBStateScope {
+
+// FM uses the same 55 state words as DXSBS002, with a separate format for
+// observed post-interpolation contributions. Existing SB bytes stay unchanged.
+bool nativeFMStateEnabled(const MixerChannel *channel) {
+    static const bool configured = []() {
+        const char *path = getenv("DOSBOX_X_NATIVE_FM_CHANNEL_TRACE");
+        const char *events = getenv("DOSBOX_X_NATIVE_AUDIO_EVENTS");
+        return MIXER_NativeAudioPhaseTracing() && path && *path && events && *events && strcmp(path,events);
+    }();
+    if (!configured || strcmp(channel->name,"FM")) return false;
+    for (auto *item = mixer.channels; item; item = item->next)
+        if (item == channel) return true;
+    return false;
+}
+struct NativeFMStates {
+    FILE *file = nullptr;
+    uint32_t records = 0, frames = 0;
+    static bool word(FILE *out,uint32_t value) { return NativeSBStates::word(out,value); }
+    NativeFMStates() {
+        file = fopen(getenv("DOSBOX_X_NATIVE_FM_CHANNEL_TRACE"),"wx");
+        if (!file || fwrite("DXFMCH02",1,8,file) != 8 || !word(file,55) || !word(file,6)) fail();
+        else MIXER_NativeAudioEvent(24,"fm-state-arm",0,0);
+    }
+    void fail() {
+        MIXER_NativeAudioEvent(24,"fm-state-failure",records,frames);
+        LOG_MSG("Native FM channel trace incomplete");
+        if (file) { fclose(file); file = nullptr; }
+    }
+    ~NativeFMStates() {
+        if (!file) return;
+        if (fwrite("DXFMEND2",1,8,file) != 8 || !word(file,records) || !word(file,frames) ||
+            !word(file,0) || fflush(file)) { fail(); return; }
+        if (fclose(file)) { file = nullptr; fail(); return; }
+        file = nullptr;
+        MIXER_NativeAudioEvent(24,"fm-state-end",records,frames);
+    }
+    void record(const MixerChannel *c,uint32_t phase,uint32_t a,uint32_t b,uint32_t d,
+                uint32_t bufferStart,uint32_t renderedStart) {
+        if (!file) return;
+        uint32_t count = 0;
+        if (phase == 21) {
+            if (c->msbuffer_i < bufferStart || c->msbuffer_i > 2048) { fail(); return; }
+            count = uint32_t(c->msbuffer_i) - bufferStart;
+        }
+        if (records >= 500000 || frames + count > 2000000) { fail(); return; }
+        const uint32_t fields[] = {
+            c->enabled,c->current_loaded,c->freq_n,c->freq_d,c->freq_d_orig,
+            c->freq_f,c->freq_fslew,c->freq_nslew,c->freq_nslew_want,uint32_t(c->max_change),
+            uint32_t(c->last[0]),uint32_t(c->last[1]),uint32_t(c->current[0]),uint32_t(c->current[1]),
+            uint32_t(c->delta[0]),uint32_t(c->delta[1]),uint32_t(c->volmul[0]),uint32_t(c->volmul[1]),
+            uint32_t(c->lowpass_alpha),uint32_t(c->lowpass_freq),c->lowpass_order,c->lowpass_on_load,c->lowpass_on_out,
+            uint32_t(c->lowpass[0][0]),uint32_t(c->lowpass[0][1]),uint32_t(c->lowpass[1][0]),uint32_t(c->lowpass[1][1]),
+            uint32_t(c->lowpass[2][0]),uint32_t(c->lowpass[2][1]),uint32_t(c->lowpass[3][0]),uint32_t(c->lowpass[3][1]),
+            uint32_t(c->lowpass[4][0]),uint32_t(c->lowpass[4][1]),uint32_t(c->lowpass[5][0]),uint32_t(c->lowpass[5][1]),
+            uint32_t(c->lowpass[6][0]),uint32_t(c->lowpass[6][1]),uint32_t(c->lowpass[7][0]),uint32_t(c->lowpass[7][1]),
+            uint32_t(c->msbuffer_i),uint32_t(c->msbuffer_o),c->rend_n,c->rend_d,c->rendering_to_n,c->rendering_to_d,
+            uint32_t(c->last_sample_write),uint32_t(int32_t(mixer.recordvol[0] * (1 << MIXER_VOLSHIFT))),
+            uint32_t(int32_t(mixer.recordvol[1] * (1 << MIXER_VOLSHIFT))),mixer.freq,
+            mixer.samples_this_ms.w,mixer.samples_this_ms.fn,mixer.samples_this_ms.fd,
+            mixer.samples_rendered_ms.w,mixer.samples_rendered_ms.fd,uint32_t(CaptureState)
+        };
+        static_assert(sizeof(fields)/sizeof(fields[0]) == 55,"FM state schema");
+        const uint32_t header[] = {records,phase,a,b,d,count,renderedStart,uint32_t(mixer.swapstereo),
+            uint32_t(mixer_sample_counter),uint32_t(mixer_sample_counter >> 32)};
+        bool good = true;
+        for (const auto value : header) good = good && word(file,value);
+        for (const auto value : fields) good = good && word(file,value);
+        uint64_t startBits;
+        static_assert(sizeof(startBits) == sizeof(mixer_start_pic_time),"FM start clock width");
+        memcpy(&startBits,&mixer_start_pic_time,sizeof(startBits));
+        const uint32_t epoch[] = {mixer.samples_per_ms.w,mixer.samples_per_ms.fn,mixer.samples_per_ms.fd,
+            uint32_t(mixer.sampleaccurate),uint32_t(startBits),uint32_t(startBits >> 32)};
+        for (const auto value : epoch) good = good && word(file,value);
+        const double pic = PIC_FullIndex();
+        uint64_t timeBits;
+        static_assert(sizeof(timeBits) == sizeof(pic),"FM trace clock width");
+        memcpy(&timeBits,&pic,sizeof(timeBits));
+        good = good && word(file,uint32_t(timeBits)) && word(file,uint32_t(timeBits >> 32));
+        for (uint32_t i = 0; good && i < count; ++i) {
+            // These are the same post-filter words added by Mix, in its actual
+            // lane order. No truncation, recording gain or DC correction here.
+            const unsigned left = mixer.swapstereo ? 1 : 0;
+            good = word(file,uint32_t(c->msbuffer[bufferStart+i][left])) &&
+                   word(file,uint32_t(c->msbuffer[bufferStart+i][1-left]));
+        }
+        if (!good || fflush(file)) { fail(); return; }
+        MIXER_NativeAudioEvent(23,"fm-state",records,phase);
+        ++records; frames += count;
+    }
+};
+void nativeFMState(const MixerChannel *c,uint32_t phase,uint32_t a=0,uint32_t b=0,uint32_t d=0,
+                   uint32_t bufferStart=0,uint32_t renderedStart=0) {
+    if (!nativeFMStateEnabled(c)) return;
+    static NativeFMStates trace;
+    trace.record(c,phase,a,b,d,bufferStart,renderedStart);
+}
+struct NativeChannelStateScope {
     const MixerChannel *channel;
     const uint32_t phase,a,b,c;
-    NativeSBStateScope(const MixerChannel *ch,uint32_t p,uint32_t x=0,uint32_t y=0,uint32_t z=0):
-        channel(ch),phase(p),a(x),b(y),c(z) { nativeSBState(channel,phase,a,b,c); }
-    ~NativeSBStateScope() { nativeSBState(channel,phase+1,a,b,c); }
+    const uint32_t fmBufferStart,fmRenderedStart;
+    NativeChannelStateScope(const MixerChannel *ch,uint32_t p,uint32_t x=0,uint32_t y=0,uint32_t z=0):
+        channel(ch),phase(p),a(x),b(y),c(z),fmBufferStart(uint32_t(ch->msbuffer_i)),fmRenderedStart(ch->rend_n) {
+        nativeSBState(channel,phase,a,b,c);
+        nativeFMState(channel,phase,a,b,c,fmBufferStart,fmRenderedStart);
+    }
+    ~NativeChannelStateScope() {
+        nativeSBState(channel,phase+1,a,b,c);
+        nativeFMState(channel,phase+1,a,b,c,fmBufferStart,fmRenderedStart);
+    }
 };
+}
+
+void MIXER_NativeFMCheckpoint(const MixerChannel *channel,uint32_t mode,uint32_t rate) {
+    nativeFMState(channel,2,mode,rate);
 }
 
 uint32_t Mixer_MIXQ(void) {
@@ -256,6 +366,7 @@ MixerChannel * MIXER_AddChannel(MIXER_Handler handler,Bitu freq,const char * nam
 
     mixer.channels=chan;
     nativeSBState(chan,0);
+    nativeFMState(chan,0);
     return chan;
 }
 
@@ -394,7 +505,7 @@ void MIXER_NativeDMAPayload(uint32_t address, uint32_t unit_bytes, bool decremen
 }
 
 void MixerChannel::UpdateVolume(void) {
-    NativeSBStateScope witness(this,40,2);
+    NativeChannelStateScope witness(this,40,2);
     volmul[0]=(Bits)((1 << MIXER_VOLSHIFT)*scale[0]*volmain[0]);
     volmul[1]=(Bits)((1 << MIXER_VOLSHIFT)*scale[1]*volmain[1]);
     if(!strcmp(name,"FM"))MIXER_NativeAudioEvent(5,"FM",volmul[0],volmul[1]);
@@ -466,7 +577,7 @@ NativeMixerTrace &nativeSBDemandTrace() { static NativeMixerTrace trace("DOSBOX_
 static void MIXER_FillUp(const char *source, unsigned reason=0, int64_t value=0);
 
 void MixerChannel::Enable(bool _yesno) {
-    NativeSBStateScope witness(this,40,5,_yesno);
+    NativeChannelStateScope witness(this,40,5,_yesno);
     if (_yesno==enabled) return;
     if(!strcmp(name,"FM"))MIXER_NativeAudioEvent(4,"FM",_yesno?1:0,rend_n);
     enabled=_yesno;
@@ -518,7 +629,7 @@ inline void MixerChannel::lowpassProc(int32_t ch[2]) {
 }
 
 void MixerChannel::SetLowpassFreq(Bitu _freq,unsigned int order) {
-    NativeSBStateScope witness(this,40,3,uint32_t(_freq),order);
+    NativeChannelStateScope witness(this,40,3,uint32_t(_freq),order);
     if (order > LOWPASS_ORDER) order = LOWPASS_ORDER;
     if (_freq == lowpass_freq && lowpass_order == order) return;
     lowpass_order = order;
@@ -527,13 +638,13 @@ void MixerChannel::SetLowpassFreq(Bitu _freq,unsigned int order) {
 }
 
 void MixerChannel::SetSlewFreq(Bitu _freq) {
-    NativeSBStateScope witness(this,40,4,uint32_t(_freq));
+    NativeChannelStateScope witness(this,40,4,uint32_t(_freq));
     freq_nslew_want = _freq;
     updateSlew();
 }
 
 void MixerChannel::SetFreq(Bitu _freq,Bitu _den) {
-    NativeSBStateScope witness(this,40,1,uint32_t(_freq),uint32_t(_den));
+    NativeChannelStateScope witness(this,40,1,uint32_t(_freq),uint32_t(_den));
     if (freq_n == _freq && freq_d == freq_d_orig)
         return;
 
@@ -552,7 +663,7 @@ void MixerChannel::SetFreq(Bitu _freq,Bitu _den) {
 void CAPTURE_MultiTrackAddWave(uint32_t freq, uint32_t len, int16_t * data,const char *name);
 
 void MixerChannel::EndFrame(Bitu samples) {
-    NativeSBStateScope witness(this,30,uint32_t(samples));
+    NativeChannelStateScope witness(this,30,uint32_t(samples));
     if(!strcmp(name,"SB")) nativeSBDemandTrace().record("end_frame",samples,0,0,msbuffer_o,current_loaded,freq_n,freq_d,freq_f,freq_fslew);
     if (CaptureState & CAPTURE_MULTITRACK_WAVE) {// TODO: should be a separate call!
         int16_t convert[1024][2];
@@ -599,7 +710,7 @@ void MixerChannel::EndFrame(Bitu samples) {
 }
 
 void MixerChannel::Mix(Bitu whole,Bitu frac) {
-    NativeSBStateScope witness(this,20,uint32_t(whole),uint32_t(frac));
+    NativeChannelStateScope witness(this,20,uint32_t(whole),uint32_t(frac));
     unsigned int patience = 2;
     Bitu upto;
 
@@ -813,7 +924,7 @@ inline bool MixerChannel::runSampleInterpolation(const Bitu upto) {
 
 template<class Type,bool stereo,bool signeddata,bool nativeorder>
 inline void MixerChannel::AddSamples(Bitu len, const Type* data) {
-    NativeSBStateScope witness(this,10,uint32_t(len),sizeof(Type) | (stereo ? 256u : 0u) | (signeddata ? 512u : 0u) | (nativeorder ? 1024u : 0u));
+    NativeChannelStateScope witness(this,10,uint32_t(len),sizeof(Type) | (stereo ? 256u : 0u) | (signeddata ? 512u : 0u) | (nativeorder ? 1024u : 0u));
     last_sample_write = (Bits)mixer.samples_rendered_ms.w;
 
     if (msbuffer_o >= 2048) {
