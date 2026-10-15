@@ -186,8 +186,8 @@ void CPU_TraceHardwareInterruptEnd(bool unwinding=false);
 void CPU_Check_NMI();
 void CPU_Raise_NMI();
 void CPU_NMI_Interrupt();
-static INLINE void CPU_HW_Interrupt(Bitu num) {
-	CPU_TraceHardwareInterruptBegin(num, CPU_TRACE_ORIGIN_OTHER);
+static INLINE void CPU_HW_Interrupt(Bitu num, CPU_TraceOrigin origin=CPU_TRACE_ORIGIN_OTHER) {
+	CPU_TraceHardwareInterruptBegin(num, origin);
 	try {
 	CPU_Interrupt(num,0,reg_eip);
 	} catch (...) {
