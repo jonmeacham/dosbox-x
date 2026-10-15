@@ -4172,7 +4172,10 @@ bool ParseCommand(char* str) {
 	if (command == "INTT") { //trace int.
 		uint8_t intNr = (uint8_t)GetHexValue(found,found);
 		DEBUG_ShowMsg("DEBUG: Tracing INT %02X\n",intNr);
-		CPU_HW_Interrupt(intNr);
+		CPU_TraceHardwareInterruptBegin(intNr, CPU_TRACE_ORIGIN_DEBUGGER);
+		try { CPU_Interrupt(intNr, 0, reg_eip); }
+		catch (...) { CPU_TraceHardwareInterruptEnd(true); throw; }
+		CPU_TraceHardwareInterruptEnd(false);
 		SetCodeWinStart();
 		return true;
 	}
@@ -4188,7 +4191,10 @@ bool ParseCommand(char* str) {
         mainMenu.get_item("debugger_runnormal").check(true).refresh_item(mainMenu);
         mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
 		DOSBOX_SetNormalLoop();
-		CPU_HW_Interrupt(intNr);
+		CPU_TraceHardwareInterruptBegin(intNr, CPU_TRACE_ORIGIN_DEBUGGER);
+		try { CPU_Interrupt(intNr, 0, reg_eip); }
+		catch (...) { CPU_TraceHardwareInterruptEnd(true); throw; }
+		CPU_TraceHardwareInterruptEnd(false);
 		return true;
 	}
 

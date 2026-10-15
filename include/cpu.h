@@ -180,11 +180,21 @@ extern bool CPU_NMI_pending;
 extern bool do_seg_limits;
 
 void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip);
+enum CPU_TraceOrigin { CPU_TRACE_ORIGIN_OTHER=0, CPU_TRACE_ORIGIN_PIC_MASTER=1, CPU_TRACE_ORIGIN_PIC_SLAVE=2, CPU_TRACE_ORIGIN_DEBUGGER=3 };
+void CPU_TraceHardwareInterruptBegin(Bitu num, CPU_TraceOrigin origin);
+void CPU_TraceHardwareInterruptEnd(bool unwinding=false);
 void CPU_Check_NMI();
 void CPU_Raise_NMI();
 void CPU_NMI_Interrupt();
 static INLINE void CPU_HW_Interrupt(Bitu num) {
+	CPU_TraceHardwareInterruptBegin(num, CPU_TRACE_ORIGIN_OTHER);
+	try {
 	CPU_Interrupt(num,0,reg_eip);
+	} catch (...) {
+		CPU_TraceHardwareInterruptEnd(true);
+		throw;
+	}
+	CPU_TraceHardwareInterruptEnd(false);
 }
 static INLINE void CPU_SW_Interrupt(Bitu num,uint32_t oldeip) {
 	CPU_Interrupt(num,CPU_INT_SOFTWARE,oldeip);

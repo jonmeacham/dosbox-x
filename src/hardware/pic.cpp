@@ -530,12 +530,18 @@ static void slave_startIRQ(){
 
     slave.start_irq(pic1_irq);
     master.start_irq(master_cascade_irq);
-    CPU_HW_Interrupt((unsigned int)slave.vector_base + (unsigned int)pic1_irq);
+    CPU_TraceHardwareInterruptBegin((unsigned int)slave.vector_base + (unsigned int)pic1_irq, CPU_TRACE_ORIGIN_PIC_SLAVE);
+    try { CPU_Interrupt((unsigned int)slave.vector_base + (unsigned int)pic1_irq, 0, reg_eip); }
+    catch (...) { CPU_TraceHardwareInterruptEnd(true); throw; }
+    CPU_TraceHardwareInterruptEnd(false);
 }
 
 static void inline master_startIRQ(Bitu i){
     master.start_irq(i);
-    CPU_HW_Interrupt(master.vector_base + i);
+    CPU_TraceHardwareInterruptBegin(master.vector_base + i, CPU_TRACE_ORIGIN_PIC_MASTER);
+    try { CPU_Interrupt(master.vector_base + i, 0, reg_eip); }
+    catch (...) { CPU_TraceHardwareInterruptEnd(true); throw; }
+    CPU_TraceHardwareInterruptEnd(false);
 }
 
 void PIC_runIRQs(void) {
