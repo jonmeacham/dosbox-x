@@ -920,6 +920,108 @@ static inline bool Mixer_irq_important(void) {
 #endif
 
 unsigned long long mixer_sample_counter = 0;
+
+// Opt-in observation of the final mixed-bus conversion. Diagnostic storage and
+// counters never feed playback. A missing footer makes a failed/capped trace
+// ineligible; no partial prefix is silently published as a complete witness.
+namespace {
+struct NativeFinalMixTrace {
+    FILE *file = nullptr;
+    uint32_t blocks = 0;
+    uint64_t frames = 0;
+    uint32_t header[24] = {};
+    int32_t raw[1024][2] = {};
+    bool pending = false;
+
+    static bool word(FILE *out, uint32_t value) {
+        const uint8_t bytes[4] = {uint8_t(value), uint8_t(value >> 8),
+                                 uint8_t(value >> 16), uint8_t(value >> 24)};
+        return fwrite(bytes, 1, 4, out) == 4;
+    }
+    static bool half(FILE *out, uint16_t value) {
+        const uint8_t bytes[2] = {uint8_t(value), uint8_t(value >> 8)};
+        return fwrite(bytes, 1, 2, out) == 2;
+    }
+    explicit NativeFinalMixTrace(const char *path) {
+        file = fopen(path, "wx");
+        if (!file || fwrite("DXMIX001", 1, 8, file) != 8) fail();
+        else MIXER_NativeAudioEvent(22, "mixdown-arm", 0, 0);
+    }
+    void fail() {
+        MIXER_NativeAudioEvent(22, "mixdown-failure", blocks, frames);
+        if (file) { fclose(file); file = nullptr; }
+        pending = false;
+    }
+    ~NativeFinalMixTrace() {
+        if (!file) return;
+        if (pending || fwrite("DXMXEND1", 1, 8, file) != 8 ||
+            !word(file, blocks) || !word(file, uint32_t(frames)) ||
+            !word(file, uint32_t(frames >> 32)) || !word(file, 0) || fflush(file)) {
+            fail(); return;
+        }
+        if (fclose(file)) { file = nullptr; fail(); return; }
+        file = nullptr;
+        MIXER_NativeAudioEvent(22, "mixdown-end", blocks, frames);
+    }
+    void begin(uint32_t previous, uint32_t whole) {
+        if (!file) return;
+        const uint32_t count = whole - previous;
+        if (pending || !count || count > 1024 || frames + count > 2000000) {
+            fail(); return;
+        }
+        const uint32_t position = uint32_t(mixer.work_in) + previous;
+        if (position + count > MIXER_BUFSIZE) { fail(); return; }
+        uint32_t gainBits[2];
+        memcpy(gainBits, mixer.recordvol, sizeof(gainBits));
+        const uint32_t fields[24] = {
+            blocks, count, uint32_t(mixer_sample_counter), uint32_t(mixer_sample_counter >> 32),
+            mixer.freq, uint32_t(mixer.dc_bias_adj), uint32_t(DC_ADJUSTMENT_STEP), uint32_t(CaptureState),
+            uint32_t(int32_t(mixer.recordvol[0] * (1 << MIXER_VOLSHIFT))),
+            uint32_t(int32_t(mixer.recordvol[1] * (1 << MIXER_VOLSHIFT))),
+            uint32_t(mixer.dc_adj[0]), uint32_t(mixer.dc_adj[1]), 0, 0,
+            position, previous, whole, mixer.samples_this_ms.w,
+            mixer.samples_this_ms.fn, mixer.samples_this_ms.fd,
+            gainBits[0], gainBits[1], 0, 0
+        };
+        memcpy(header, fields, sizeof(header));
+        for (uint32_t i = 0; i < count; ++i) {
+            raw[i][0] = mixer.work[position + i][0];
+            raw[i][1] = mixer.work[position + i][1];
+        }
+        pending = true;
+    }
+    void finish(const int16_t *converted) {
+        if (!file || !pending) return;
+        header[12] = uint32_t(mixer.dc_adj[0]);
+        header[13] = uint32_t(mixer.dc_adj[1]);
+        bool good = true;
+        for (const auto value : header) good = good && word(file, value);
+        const double pic = PIC_FullIndex();
+        uint64_t timeBits;
+        static_assert(sizeof(timeBits) == sizeof(pic), "trace clock width");
+        memcpy(&timeBits, &pic, sizeof(timeBits));
+        good = good && word(file, uint32_t(timeBits)) && word(file, uint32_t(timeBits >> 32));
+        for (uint32_t i = 0; good && i < header[1]; ++i) {
+            good = word(file, uint32_t(raw[i][0])) && word(file, uint32_t(raw[i][1])) &&
+                word(file, uint32_t(mixer.work[header[14] + i][0])) &&
+                word(file, uint32_t(mixer.work[header[14] + i][1])) &&
+                half(file, converted ? uint16_t(converted[i * 2]) : 0) &&
+                half(file, converted ? uint16_t(converted[i * 2 + 1]) : 0);
+        }
+        if (!good || fflush(file)) { fail(); return; }
+        MIXER_NativeAudioEvent(21, "mixdown", blocks, header[1]);
+        frames += header[1];
+        ++blocks;
+        pending = false;
+    }
+};
+NativeFinalMixTrace *nativeFinalMixTrace() {
+    static const char *path = getenv("DOSBOX_X_NATIVE_FINAL_MIX_TRACE");
+    if (!path || !*path) return nullptr;
+    static NativeFinalMixTrace trace(path);
+    return &trace;
+}
+}
 double mixer_start_pic_time = 0;
 
 /* once a millisecond, render 1ms of audio, up to whole samples */
@@ -943,6 +1045,9 @@ static void MIXER_MixData(Bitu fracs/*render up to*/) {
         if (endframe) chan->EndFrame(mixer.samples_this_ms.w);
         chan=chan->next;
     }
+
+    auto *finalMixTrace = nativeFinalMixTrace();
+    if (finalMixTrace) finalMixTrace->begin(uint32_t(prev_rendered), uint32_t(whole));
 
     /* In case of DOS games that play samples with a DC offset that is WAY off center,
      * the mixdown should do a very slow adjustment to center the waveform. On modern
@@ -981,7 +1086,9 @@ static void MIXER_MixData(Bitu fracs/*render up to*/) {
         }
         assert(readpos <= MIXER_BUFSIZE);
         CAPTURE_AddWave( mixer.freq, added, (int16_t*)convert );
+        if (finalMixTrace) finalMixTrace->finish((int16_t*)convert);
     }
+    else if (finalMixTrace) finalMixTrace->finish(nullptr);
 
     mixer.samples_rendered_ms.w = whole;
     mixer.samples_rendered_ms.fd = frac;
