@@ -2493,6 +2493,13 @@ static uint32_t scheduled_exec_dump_regs_register_value(const uint32_t id) {
 	}
 }
 
+static uint32_t scheduled_exec_dump_regs_base_value(const uint32_t id) {
+	// SP is a stack-relative alias for the low word of ESP. Keep ESP as the
+	// original full-width register in the DXEXE002 record below.
+	if (id == 8) return reg_esp & 0xffffu;
+	return scheduled_exec_dump_regs_register_value(id);
+}
+
 static void capture_scheduled_exec_dump_regs() {
 	if (scheduled_exec_dump_regs.empty()) return;
 	const uint32_t linear_ip = static_cast<uint32_t>(SegPhys(cs) + reg_eip);
@@ -2514,7 +2521,7 @@ static void capture_scheduled_exec_dump_regs() {
 		}
 		const uint32_t segment_base = static_cast<uint32_t>(segment_base_value);
 		const int64_t resolved = static_cast<int64_t>(segment_base_value) +
-		        static_cast<int64_t>(scheduled_exec_dump_regs_register_value(
+		        static_cast<int64_t>(scheduled_exec_dump_regs_base_value(
 		                request.base_reg_id)) + request.signed_offset;
 		if (resolved < 0 || resolved > static_cast<int64_t>(UINT32_MAX) ||
 		    static_cast<uint64_t>(resolved) + request.length >
@@ -3928,6 +3935,7 @@ bool ParseCommand(char* str) {
 		else if (base_reg_text == "EDI") base_reg_id = 5;
 		else if (base_reg_text == "EBP") base_reg_id = 6;
 		else if (base_reg_text == "ESP") base_reg_id = 7;
+		else if (base_reg_text == "SP") base_reg_id = 8;
 		else valid = false;
 		uint32_t match_reg_id = 0;
 		if (match_reg == "EAX") match_reg_id = 0;
@@ -3966,7 +3974,7 @@ bool ParseCommand(char* str) {
 		if (!valid) {
 			DEBUG_ShowMsg("DEBUG: ADDEXECDUMPREG syntax: delay-ms duration-ms "
 			              "linear-ip matchReg matchValue max-hits LINEAR|DS|SS "
-			              "baseReg(EAX..ESP) signed-decimal-offset hex-length filename.\n");
+			              "baseReg(EAX..ESP|SP) signed-decimal-offset hex-length filename.\n");
 			return true;
 		}
 		ScheduledExecDumpRegs request;
@@ -5406,7 +5414,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("ADDSEEKKEY delay s:o ...   - Seek guest memory with two keys.\n");
 		DEBUG_ShowMsg("ADDMEMDUMP delay s:o n file - Queue a binary memory dump before resuming.\n");
 		DEBUG_ShowMsg("ADDEXECDUMP delay duration ip reg value hits s:o len file - Capture matched instruction state.\n");
-		DEBUG_ShowMsg("ADDEXECDUMPREG delay duration ip matchReg value hits segment baseReg signedOffset len file - Capture register-relative state.\n");
+		DEBUG_ShowMsg("ADDEXECDUMPREG delay duration ip matchReg value hits segment baseReg(EAX..ESP|SP) signedOffset len file - Capture register-relative state.\n");
 
 		DEBUG_ShowMsg("IN[P|W|D] [port]          - I/O port read byte/word/dword.\n");
 		DEBUG_ShowMsg("OUT[P|W|D] [port] [data]  - I/O port write byte/word/dword.\n");
