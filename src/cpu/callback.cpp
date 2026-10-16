@@ -43,6 +43,130 @@ unsigned int last_callback = 0;
 CallBack_Handler CallBack_Handlers[CB_MAX] = {NULL};
 char* CallBack_Description[CB_MAX] = {NULL};
 
+#if C_DEBUG
+#include "pic.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <vector>
+extern Bitu cycle_count;
+namespace {
+struct NativeCallbackJournal {
+    struct Scope { uint64_t id, parent; const char *kind; Bitu callback; };
+    bool configured = false, enabled = false, begun = false, finished = false;
+    FILE *file = nullptr;
+    double start = 0, end = 0;
+    uint64_t next = 0, rows = 0, maximum = 0;
+    std::vector<Scope> stack;
+    bool configure() {
+        if (configured) return enabled;
+        configured = true;
+        const char *path = std::getenv("DOSBOX_X_NATIVE_CALLBACK_TRACE");
+        const char *first = std::getenv("DOSBOX_X_NATIVE_CALLBACK_START_MS");
+        const char *last = std::getenv("DOSBOX_X_NATIVE_CALLBACK_END_MS");
+        const char *limit = std::getenv("DOSBOX_X_NATIVE_CALLBACK_MAX_ROWS");
+        if (!path || !*path || !first || !last || !limit) return false;
+        char *tail = nullptr;
+        start = std::strtod(first, &tail);
+        if (!tail || *tail || !std::isfinite(start) || start < 0) return false;
+        end = std::strtod(last, &tail);
+        if (!tail || *tail || !std::isfinite(end) || end <= start || end > 600000) return false;
+        maximum = std::strtoull(limit, &tail, 10);
+        if (!tail || *tail || maximum == 0 || maximum > 1000000) return false;
+        file = std::fopen(path, "wx");
+        if (!file) return false;
+        enabled = true;
+        std::fprintf(file, "#DXCB001 {\"start_ms\":%.17g,\"end_ms\":%.17g,\"max_rows\":%llu}\n",
+                     start, end, (unsigned long long)maximum);
+        return true;
+    }
+    void ancestry() {
+        std::fputs("[", file);
+        bool first = true;
+        for (const auto &s : stack) {
+            std::fprintf(file, "%s{\"id\":%llu,\"parent\":%llu,\"kind\":\"%s\",\"callback\":%llu}",
+                         first ? "" : ",", (unsigned long long)s.id, (unsigned long long)s.parent,
+                         s.kind, (unsigned long long)s.callback);
+            first = false;
+        }
+        std::fputs("]", file);
+    }
+    void finish(const char *reason) {
+        if (!file || finished) return;
+        std::fprintf(file, "#END {\"reason\":\"%s\",\"rows\":%llu,\"pic_ms\":%.17g,\"right_open\":",
+                     reason, (unsigned long long)rows, double(PIC_FullIndex()));
+        ancestry(); std::fputs("}\n", file); std::fflush(file);
+        finished = true;
+    }
+    bool touch() {
+        if (finished) return false;
+        const double now = double(PIC_FullIndex());
+        if (now >= end) { finish("window_complete"); return false; }
+        if (now < start) return false;
+        if (!begun) {
+            std::fprintf(file, "#BEGIN {\"pic_ms\":%.17g,\"left_open\":", now);
+            ancestry(); std::fputs("}\n", file); begun = true;
+        }
+        if (rows >= maximum) { finish("hit_limit"); return false; }
+        return true;
+    }
+    void emit(const Scope &s, const char *stage, Bitu result) {
+        if (!touch()) return;
+        // Hex avoids quoting arbitrary callback descriptions. No lazy-flag
+        // materialization, guest memory access, or guest budget mutation.
+        char description[1025] = {};
+        uintptr_t handler = 0;
+        if (s.callback > 0 && s.callback < CB_MAX) {
+            handler = (uintptr_t)CallBack_Handlers[s.callback];
+            const char *text = CallBack_Description[s.callback];
+            const char *hex = "0123456789abcdef";
+            for (unsigned i = 0; text && text[i] && i < 512; ++i) {
+                const unsigned char c = (unsigned char)text[i];
+                description[i*2] = hex[c >> 4]; description[i*2+1] = hex[c & 15];
+            }
+        }
+        std::fprintf(file,
+            "{\"row\":%llu,\"id\":%llu,\"parent\":%llu,\"kind\":\"%s\",\"stage\":\"%s\",\"result\":%llu,\"callback\":%llu,\"handler_address\":%llu,\"description_hex\":\"%s\","
+            "\"pic_ms\":%.17g,\"cycle_count\":%llu,\"cpu_cycles\":%lld,\"cpu_cycle_left\":%lld,\"cpu_cycle_max\":%lld,\"cpu_io_delay_removed\":%lld,"
+            "\"cs\":%u,\"cs_base\":%u,\"eip\":%u,\"ss\":%u,\"ss_base\":%u,\"esp\":%u,\"stack_big\":%u,\"stack_mask\":%u,\"stack_notmask\":%u,\"code_big\":%u,\"pmode\":%u,\"cpl\":%u,\"if\":%u,\"raw_flags\":%u,"
+            "\"eax\":%u,\"ebx\":%u,\"ecx\":%u,\"edx\":%u,\"esi\":%u,\"edi\":%u,\"ebp\":%u,\"ds\":%u,\"es\":%u,\"last_callback\":%u,\"callback_segment\":%u,\"callback_offset\":%u}\n",
+            (unsigned long long)rows++, (unsigned long long)s.id, (unsigned long long)s.parent, s.kind, stage,
+            (unsigned long long)result, (unsigned long long)s.callback, (unsigned long long)handler, description,
+            double(PIC_FullIndex()), (unsigned long long)cycle_count,
+            (long long)CPU_Cycles, (long long)CPU_CycleLeft, (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved,
+            unsigned(SegValue(cs)), unsigned(SegPhys(cs)), unsigned(reg_eip), unsigned(SegValue(ss)), unsigned(SegPhys(ss)), unsigned(reg_esp),
+            unsigned(cpu.stack.big), unsigned(cpu.stack.mask), unsigned(cpu.stack.notmask), unsigned(cpu.code.big), unsigned(cpu.pmode), unsigned(cpu.cpl),
+            unsigned((reg_flags & FLAG_IF) != 0), unsigned(reg_flags), unsigned(reg_eax), unsigned(reg_ebx), unsigned(reg_ecx), unsigned(reg_edx),
+            unsigned(reg_esi), unsigned(reg_edi), unsigned(reg_ebp), unsigned(SegValue(ds)), unsigned(SegValue(es)), last_callback, unsigned(CB_SEG), unsigned(CB_SOFFSET));
+        if (std::ferror(file)) finish("io_error");
+    }
+    uint64_t enter(const char *kind, Bitu callback) {
+        if (!configure() || finished) return 0;
+        touch();
+        if (finished) return 0;
+        if (stack.size() >= 1024) { finish("depth_limit"); return 0; }
+        Scope s = {++next, stack.empty() ? 0 : stack.back().id, kind, callback};
+        stack.push_back(s); emit(s, "entry", 0); return s.id;
+    }
+    void mark(uint64_t id, const char *stage, Bitu result) {
+        if (id && !stack.empty() && stack.back().id == id) emit(stack.back(), stage, result);
+    }
+    void leave(uint64_t id) {
+        if (!id) return;
+        if (stack.empty() || stack.back().id != id) { finish("scope_mismatch"); return; }
+        emit(stack.back(), std::uncaught_exception() ? "cpp_unwind" : "exit", 0); stack.pop_back();
+    }
+    ~NativeCallbackJournal() { if (file) { finish("process_exit"); std::fclose(file); } }
+} native_callback_journal;
+}
+NativeCallbackScope::NativeCallbackScope(const char *kind, Bitu callback) {
+    id = native_callback_journal.enter(kind, callback);
+}
+NativeCallbackScope::~NativeCallbackScope() { native_callback_journal.leave(id); }
+void NativeCallbackScope::mark(const char *stage, Bitu result) { native_callback_journal.mark(id, stage, result); }
+#endif
+
 Bitu call_stop,call_default;
 uint8_t call_idle;
 Bitu call_priv_io;
@@ -109,6 +233,9 @@ void CALLBACK_DeAllocate(Bitu in) {
 
 
 void CALLBACK_Idle(void) {
+#if C_DEBUG
+    NativeCallbackScope trace("idle");
+#endif
 #if C_EMSCRIPTEN
 	void GFX_Events();
 	GFX_Events();
@@ -123,7 +250,13 @@ void CALLBACK_Idle(void) {
 	reg_eip=CB_SOFFSET+call_idle*CB_SIZE;
 	CPU_CycleLeft += CPU_Cycles - 1; /* Ahem: This makes the CPU execute instructions to handle IRQs and then come back. Nothing more. */
 	CPU_Cycles = 1;
+#if C_DEBUG
+    trace.mark("selected");
+#endif
 	DOSBOX_RunMachine();
+#if C_DEBUG
+    trace.mark("machine_return");
+#endif
 	reg_eip=oldeip;
 	SegSet16(cs,oldcs);
 	SETFLAGBIT(IF,oldIF);
@@ -134,6 +267,9 @@ void CALLBACK_Idle(void) {
 }
 
 void CALLBACK_IdleNoInts(void) {
+#if C_DEBUG
+    NativeCallbackScope trace("idle_no_ints");
+#endif
 #if C_EMSCRIPTEN
 	void GFX_Events();
 	GFX_Events();
@@ -148,7 +284,13 @@ void CALLBACK_IdleNoInts(void) {
 	reg_eip=CB_SOFFSET+call_idle*CB_SIZE;
 	CPU_CycleLeft += CPU_Cycles - 1; /* Ahem: This makes the CPU execute instructions to handle IRQs and then come back. Nothing more. */
 	CPU_Cycles = 1;
+#if C_DEBUG
+    trace.mark("selected");
+#endif
 	DOSBOX_RunMachine();
+#if C_DEBUG
+    trace.mark("machine_return");
+#endif
 	reg_eip=oldeip;
 	SegSet16(cs,oldcs);
 //	SETFLAGBIT(IF,oldIF);

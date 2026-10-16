@@ -482,15 +482,24 @@ static Bitu Normal_Loop(void) {
                     if (GCC_UNLIKELY((unsigned int)ret >= CB_MAX))
                         return 0;
 
+#if C_DEBUG
+                    NativeCallbackScope callback_trace("dispatch", (Bitu)ret);
+#endif
                     extern unsigned int last_callback;
                     unsigned int p_last_callback = last_callback;
                     last_callback = (unsigned int)ret;
 
                     dosbox_allow_nonrecursive_page_fault = false;
                     Bitu blah = (*CallBack_Handlers[ret])();
+#if C_DEBUG
+                    callback_trace.mark("handler_return", blah);
+#endif
                     dosbox_allow_nonrecursive_page_fault = saved_allow;
 
                     last_callback = p_last_callback;
+#if C_DEBUG
+                    callback_trace.mark("restored", blah);
+#endif
 
 #ifdef DEBUG_CYCLE_OVERRUN_CALLBACK
                     {
@@ -736,6 +745,9 @@ volatile int runmachine_recursion = 0;
 #endif
 
 void DOSBOX_RunMachine(void){
+#if C_DEBUG
+    NativeCallbackScope machine_trace("machine");
+#endif
     Bitu ret;
 
     extern unsigned int last_callback;

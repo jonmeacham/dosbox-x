@@ -59,6 +59,19 @@ static inline PhysPt CALLBACK_GetBase(void) {
 
 uint8_t CALLBACK_Allocate();
 
+#if C_DEBUG
+// Opt-in diagnostic scopes; raw CPU state is observed without FillFlags.
+class NativeCallbackScope {
+    uint64_t id = 0;
+public:
+    explicit NativeCallbackScope(const char *kind, Bitu callback = 0);
+    ~NativeCallbackScope();
+    void mark(const char *stage, Bitu result = 0);
+    NativeCallbackScope(const NativeCallbackScope &) = delete;
+    NativeCallbackScope &operator=(const NativeCallbackScope &) = delete;
+};
+#endif
+
 void CALLBACK_Idle(void);
 
 
