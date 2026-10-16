@@ -492,7 +492,14 @@ decode_end:
         return CBRET_NONE;
 #endif
 	}
+#if C_DEBUG
+    {
+        NativeCallbackScope flags_trace("decoder_flags");
+        FillFlags();
+    }
+#else
     FillFlags();
+#endif
     return CBRET_NONE;
 #if !C_DEBUG
 decode_end:

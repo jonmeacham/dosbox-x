@@ -736,6 +736,9 @@ bool PIC_RunQueue(void) {
     if (IsDebuggerActive() && !IsDebuggerRunwatch())
         return false;
 #endif
+#if C_DEBUG
+    NativeCallbackScope queue_trace("pic_queue");
+#endif
 #ifdef DEBUG_CPU_CYCLE_OVERRUN
     /* I/O delay can cause negative CPU_Cycles and PIC event / audio rendering issues */
     cpu_cycles_count_t overrun = -std::min(CPU_Cycles,(cpu_cycles_count_t)0);
@@ -747,6 +750,9 @@ bool PIC_RunQueue(void) {
     /* Check to see if a new millisecond needs to be started */
     CPU_CycleLeft += CPU_Cycles;
     CPU_Cycles = 0;
+#if C_DEBUG
+    queue_trace.mark("consolidated");
+#endif
 
 #ifdef DEBUG_PIC_IRQCHECK_VS_IRR
     // WARNING: If the problem is the cascade interrupt un-acknowledged, this will give a false positive
@@ -794,6 +800,9 @@ bool PIC_RunQueue(void) {
     }
 
     /* if we're out of cycles, then return false. don't execute any more instructions */
+#if C_DEBUG
+    queue_trace.mark("returned", (CPU_CycleLeft+CPU_Cycles) > 0 ? 1 : 0);
+#endif
     if ((CPU_CycleLeft+CPU_Cycles) <= 0)
         return false;
 
@@ -852,6 +861,9 @@ static unsigned long PIC_tickstart = 0;
 
 extern void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused);
 void TIMER_AddTick(void) {
+#if C_DEBUG
+    NativeCallbackScope tick_trace("timer_tick");
+#endif
     /* Setup new amount of cycles for PIC */
     PIC_Ticks++;
     if ((PIC_Ticks&0x3fff) == 0) {
@@ -863,6 +875,9 @@ void TIMER_AddTick(void) {
     }
     CPU_CycleLeft += CPU_CycleMax + CPU_Cycles;
     CPU_Cycles = 0;
+#if C_DEBUG
+    tick_trace.mark("replenished");
+#endif
 
     /* timeout */
     if (time_limit_ms != 0 && PIC_Ticks >= time_limit_ms)
