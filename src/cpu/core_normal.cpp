@@ -481,13 +481,25 @@ restart_opcode:
 			continue;
 		}
 		SAVEIP;
+#if C_DEBUG
+        // POPF/POPFD can leave the decoder with a pending PIC/trap check.
+        // Keep instruction_scope alive until EIP and flags are finalized;
+        // an outside-loop label would destroy it before SAVEIP/FillFlags.
+        continue;
+decode_end:
+        SAVEIP;
+        FillFlags();
+        return CBRET_NONE;
+#endif
 	}
     FillFlags();
     return CBRET_NONE;
+#if !C_DEBUG
 decode_end:
 	SAVEIP;
 	FillFlags();
 	return CBRET_NONE;
+#endif
 }
 
 Bits CPU_Core_Normal_Trap_Run(void) {
