@@ -95,6 +95,12 @@ void DoString(STRING_OP_NORMAL type) {
     }
 #endif
 
+#ifdef ALBION_NATIVE_NORMAL_INSTRUCTION_TRACE
+    if (type == R_CMPSB || type == R_CMPSW || type == R_CMPSD) {
+        native_instruction_trace.cmps(type == R_CMPSB ? 1 : type == R_CMPSW ? 2 : 4,
+            count, si_base, di_base, si_index, di_index, add_mask, add_index, TEST_PREFIX_REP != 0, core.rep_zero);
+    }
+#endif
 	if (count != 0) {
 		try {
 			switch (type) {

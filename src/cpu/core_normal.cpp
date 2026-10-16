@@ -58,6 +58,10 @@ struct NativeInstructionTrace {
     bool configured = false, active = false, finished = false;
     FILE *file = nullptr;
     double start = 0, end = 0;
+    double trigger_duration = 0;
+    uint64_t trigger_address = 0;
+    uint64_t trigger_eax_mask = 0, trigger_eax_value = 0;
+    bool triggered = false;
     uint64_t limit = 0, instructions = 0, rows = 0, runs = 0;
     std::vector<uint64_t> stack;
 
@@ -68,21 +72,87 @@ struct NativeInstructionTrace {
         const char *first = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_START_MS");
         const char *last = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_END_MS");
         const char *maximum = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_MAX");
+        const char *trigger = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRIGGER_ADDRESS");
+        const char *duration = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRIGGER_DURATION_MS");
+        const char *eax_mask = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRIGGER_EAX_MASK");
+        const char *eax_value = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRIGGER_EAX_VALUE");
         if (!path || !*path || !first || !last || !maximum) return false;
         char *tail = nullptr;
         start = std::strtod(first, &tail);
         if (!tail || *tail || !std::isfinite(start) || start < 0) return false;
         end = std::strtod(last, &tail);
-        if (!tail || *tail || !std::isfinite(end) || end <= start || end - start > 1000 || end > 600000) return false;
+        if (!tail || *tail || !std::isfinite(end) || end <= start || end > 600000) return false;
+        if (trigger || duration) {
+            if (!trigger || !*trigger || !duration || !*duration) return false;
+            trigger_address = std::strtoull(trigger, &tail, 0);
+            if (!tail || *tail || !trigger_address || trigger_address > UINT32_MAX) return false;
+            trigger_duration = std::strtod(duration, &tail);
+            if (!tail || *tail || !std::isfinite(trigger_duration) || trigger_duration <= 0 || trigger_duration > 1000 || end + trigger_duration > 600000) return false;
+        } else if (end - start > 1000) return false;
+        if (eax_mask || eax_value) {
+            if (!trigger_address || !eax_mask || !*eax_mask || !eax_value || !*eax_value) return false;
+            trigger_eax_mask = std::strtoull(eax_mask, &tail, 0);
+            if (!tail || *tail || !trigger_eax_mask || trigger_eax_mask > UINT32_MAX) return false;
+            trigger_eax_value = std::strtoull(eax_value, &tail, 0);
+            if (!tail || *tail || trigger_eax_value > UINT32_MAX || (trigger_eax_value & ~trigger_eax_mask)) return false;
+        }
         limit = std::strtoull(maximum, &tail, 10);
         if (!tail || *tail || !limit || limit > 1000000) return false;
         file = std::fopen(path, "wx");
         if (!file) return false;
+        if (trigger_address) {
+            std::fprintf(file, "#DXARM001 {\"start_ms\":%.17g,\"end_ms\":%.17g,\"address\":%llu,\"duration_ms\":%.17g",
+                         start, end, (unsigned long long)trigger_address, trigger_duration);
+            if (trigger_eax_mask) std::fprintf(file, ",\"eax_mask\":%llu,\"eax_value\":%llu",
+                (unsigned long long)trigger_eax_mask, (unsigned long long)trigger_eax_value);
+            std::fputs("}\n", file);
+        } else write_header();
+        active = !std::ferror(file);
+        return active;
+    }
+    void write_header() {
         std::fprintf(file, "#DXINS001 {\"start_ms\":%.17g,\"end_ms\":%.17g,\"maximum_instructions\":%llu,\"entry_after_loop_debit\":1}\n",
                      start, end, (unsigned long long)limit);
         std::fprintf(file, "row,id,parent,run,phase,pic_ms,cycle_count,cpu_cycles,cpu_cycle_left,cpu_cycle_max,cpu_io_delay_removed,cs,cs_base,eip,ss,ss_base,esp,stack_big,stack_mask,stack_notmask,code_big,pmode,cpl,if,raw_flags,eax,ebx,ecx,edx,esi,edi,ebp,ds,es,opcode_status,opcode_hex,outcome\n");
-        active = !std::ferror(file);
-        return active;
+    }
+    void opl_read(Bitu port, Bitu width) {
+        if (!active || finished || stack.empty()) return;
+        std::fprintf(file, "#DXOPL001 {\"id\":%llu,\"cycle_count\":%llu,\"pic_ms\":%.17g,\"cpu_cycles\":%lld,\"cpu_cycle_left\":%lld,\"cpu_cycle_max\":%lld,\"cpu_io_delay_removed\":%lld,\"port\":%u,\"width\":%u}\n",
+            (unsigned long long)stack.back(), (unsigned long long)cycle_count, double(PIC_FullIndex()),
+            (long long)CPU_Cycles, (long long)CPU_CycleLeft, (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved,
+            unsigned(port), unsigned(width));
+        if (std::ferror(file)) finish("io_error");
+    }
+    void cmps(unsigned size, Bitu count, PhysPt source, PhysPt destination,
+              uint32_t si, uint32_t di, uint32_t mask, Bits direction, bool repeat, bool equal) {
+        if (!active || finished || stack.empty()) return;
+        const Bitu bound = std::min(count, Bitu(CPU_Cycles > 0 ? CPU_Cycles : 1));
+        const int step = int(direction) * int(size);
+        char source_hex[513] = {}, destination_hex[513] = {};
+        const char *status = "ok";
+        static const char digits[] = "0123456789abcdef";
+        if (bound > 64 || size > 4) status = "iteration_bound";
+        else for (Bitu i = 0; i < bound; ++i) {
+            for (unsigned j = 0; j < size; ++j) {
+                const uint64_t sa = uint64_t(source) + ((si + uint32_t(int64_t(step) * int64_t(i))) & mask) + j;
+                const uint64_t da = uint64_t(destination) + ((di + uint32_t(int64_t(step) * int64_t(i))) & mask) + j;
+                uint8_t sv = 0, dv = 0;
+                if (sa > UINT32_MAX || da > UINT32_MAX || mem_readb_checked(LinearPt(sa), &sv) || mem_readb_checked(LinearPt(da), &dv)) {
+                    status = "unreadable"; break;
+                }
+                const Bitu index = (i * size + j) * 2;
+                source_hex[index] = digits[sv >> 4]; source_hex[index + 1] = digits[sv & 15];
+                destination_hex[index] = digits[dv >> 4]; destination_hex[index + 1] = digits[dv & 15];
+            }
+            if (status[0] != 'o') break;
+        }
+        if (status[0] != 'o') source_hex[0] = destination_hex[0] = 0;
+        std::fprintf(file, "#DXCMP001 {\"id\":%llu,\"cycle_count\":%llu,\"cpu_cycles\":%lld,\"cpu_cycle_left\":%lld,\"cpu_cycle_max\":%lld,\"cpu_io_delay_removed\":%lld,\"operand_size\":%u,\"count\":%llu,\"maximum_iterations\":%llu,\"source_base\":%u,\"destination_base\":%u,\"si\":%u,\"di\":%u,\"address_mask\":%u,\"step\":%d,\"repeat\":%u,\"repeat_equal\":%u,\"status\":\"%s\",\"source_hex\":\"%s\",\"destination_hex\":\"%s\"}\n",
+            (unsigned long long)stack.back(), (unsigned long long)cycle_count,
+            (long long)CPU_Cycles, (long long)CPU_CycleLeft, (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved,
+            size, (unsigned long long)count, (unsigned long long)bound, unsigned(source), unsigned(destination),
+            si, di, mask, step, unsigned(repeat), unsigned(equal), status, source_hex, destination_hex);
+        if (std::ferror(file)) finish("io_error");
     }
     void finish(const char *reason) {
         if (!file || finished) return;
@@ -135,6 +205,16 @@ struct NativeInstructionScope {
         auto &trace = native_instruction_trace;
         if (!trace.active) return;
         const double now = double(PIC_FullIndex());
+        if (trace.trigger_address && !trace.triggered) {
+            if (now < trace.start) return;
+            if (now >= trace.end) { trace.finish("trigger_not_reached"); return; }
+            if (uint64_t(SegPhys(cs)) + uint64_t(reg_eip) != trace.trigger_address) return;
+            if (trace.trigger_eax_mask && (uint64_t(reg_eax) & trace.trigger_eax_mask) != trace.trigger_eax_value) return;
+            trace.triggered = true;
+            trace.start = now;
+            trace.end = now + trace.trigger_duration;
+            trace.write_header();
+        }
         if (now < trace.start) return;
         if (now >= trace.end && trace.stack.empty()) { trace.finish("window_complete"); return; }
         if (trace.instructions >= trace.limit) { trace.finish("instruction_limit"); return; }
@@ -150,6 +230,10 @@ struct NativeInstructionScope {
         if (!trace.stack.empty()) trace.stack.pop_back();
     }
 };
+}
+
+void NativeInstructionTraceOPLRead(Bitu port, Bitu width) {
+    native_instruction_trace.opl_read(port, width);
 }
 #endif
 
@@ -260,7 +344,11 @@ static INLINE uint32_t Fetchd() {
 
 #include "instructions.h"
 #include "core_normal/support.h"
+#if C_DEBUG
+#define ALBION_NATIVE_NORMAL_INSTRUCTION_TRACE 1
+#endif
 #include "core_normal/string.h"
+#undef ALBION_NATIVE_NORMAL_INSTRUCTION_TRACE
 
 
 #define EALookupTable (core.ea_table)

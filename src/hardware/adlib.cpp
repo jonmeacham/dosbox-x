@@ -49,6 +49,9 @@ bool adlib_force_timer_overflow_on_polling = false;
 bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
 extern bool show_recorded_filename;
 extern std::string pathopl;
+#if C_DEBUG
+extern void NativeInstructionTraceOPLRead(Bitu port, Bitu width);
+#endif
 
 unsigned int single_opl_write_counter = 0;
 bool adlib_pcm_boost = false;
@@ -1335,6 +1338,9 @@ void Module::PortWrite( Bitu port, Bitu val, Bitu iolen ) {
 
 
 Bitu Module::PortRead( Bitu port, Bitu iolen ) {
+#if C_DEBUG
+    ::NativeInstructionTraceOPLRead(port, iolen);
+#endif
     (void)iolen;//UNUSED
 	//roughly half a micro (as we already do 1 micro on each port read and some tests revealed it taking 1.5 micros to read an adlib port)
 	Bits delaycyc = (CPU_CycleMax/2048);
