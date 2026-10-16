@@ -201,27 +201,40 @@ bool nativeFMStateEnabled(const MixerChannel *channel) {
         if (item == channel) return true;
     return false;
 }
-struct NativeFMStates {
+struct NativeChannelTraceProfile {
+    const char *environment, *header, *footer, *state, *arm, *end, *failure;
+    unsigned stateEvent, lifeEvent;
+};
+const NativeChannelTraceProfile fmTraceProfile = {
+    "DOSBOX_X_NATIVE_FM_CHANNEL_TRACE", "DXFMCH02", "DXFMEND2",
+    "fm-state", "fm-state-arm", "fm-state-end", "fm-state-failure", 23, 24
+};
+const NativeChannelTraceProfile sbTraceProfile = {
+    "DOSBOX_X_NATIVE_SB_CHANNEL_TRACE", "DXSBCH01", "DXSCEND1",
+    "sb-channel", "sb-channel-arm", "sb-channel-end", "sb-channel-failure", 25, 26
+};
+struct NativeChannelStates {
+    const NativeChannelTraceProfile &profile;
     FILE *file = nullptr;
     uint32_t records = 0, frames = 0;
     static bool word(FILE *out,uint32_t value) { return NativeSBStates::word(out,value); }
-    NativeFMStates() {
-        file = fopen(getenv("DOSBOX_X_NATIVE_FM_CHANNEL_TRACE"),"wx");
-        if (!file || fwrite("DXFMCH02",1,8,file) != 8 || !word(file,55) || !word(file,6)) fail();
-        else MIXER_NativeAudioEvent(24,"fm-state-arm",0,0);
+    explicit NativeChannelStates(const NativeChannelTraceProfile &p): profile(p) {
+        file = fopen(getenv(profile.environment),"wx");
+        if (!file || fwrite(profile.header,1,8,file) != 8 || !word(file,55) || !word(file,6)) fail();
+        else MIXER_NativeAudioEvent(profile.lifeEvent,profile.arm,0,0);
     }
     void fail() {
-        MIXER_NativeAudioEvent(24,"fm-state-failure",records,frames);
-        LOG_MSG("Native FM channel trace incomplete");
+        MIXER_NativeAudioEvent(profile.lifeEvent,profile.failure,records,frames);
+        LOG_MSG("Native channel trace incomplete: %s",profile.state);
         if (file) { fclose(file); file = nullptr; }
     }
-    ~NativeFMStates() {
+    ~NativeChannelStates() {
         if (!file) return;
-        if (fwrite("DXFMEND2",1,8,file) != 8 || !word(file,records) || !word(file,frames) ||
+        if (fwrite(profile.footer,1,8,file) != 8 || !word(file,records) || !word(file,frames) ||
             !word(file,0) || fflush(file)) { fail(); return; }
         if (fclose(file)) { file = nullptr; fail(); return; }
         file = nullptr;
-        MIXER_NativeAudioEvent(24,"fm-state-end",records,frames);
+        MIXER_NativeAudioEvent(profile.lifeEvent,profile.end,records,frames);
     }
     void record(const MixerChannel *c,uint32_t phase,uint32_t a,uint32_t b,uint32_t d,
                 uint32_t bufferStart,uint32_t renderedStart) {
@@ -273,14 +286,27 @@ struct NativeFMStates {
                    word(file,uint32_t(c->msbuffer[bufferStart+i][1-left]));
         }
         if (!good || fflush(file)) { fail(); return; }
-        MIXER_NativeAudioEvent(23,"fm-state",records,phase);
+        MIXER_NativeAudioEvent(profile.stateEvent,profile.state,records,phase);
         ++records; frames += count;
     }
 };
 void nativeFMState(const MixerChannel *c,uint32_t phase,uint32_t a=0,uint32_t b=0,uint32_t d=0,
                    uint32_t bufferStart=0,uint32_t renderedStart=0) {
     if (!nativeFMStateEnabled(c)) return;
-    static NativeFMStates trace;
+    static NativeChannelStates trace(fmTraceProfile);
+    trace.record(c,phase,a,b,d,bufferStart,renderedStart);
+}
+void nativeSBChannelState(const MixerChannel *c,uint32_t phase,uint32_t a=0,uint32_t b=0,uint32_t d=0,
+                          uint32_t bufferStart=0,uint32_t renderedStart=0) {
+    static const bool configured = []() {
+        const char *path = getenv("DOSBOX_X_NATIVE_SB_CHANNEL_TRACE");
+        return path && *path;
+    }();
+    // Reuse the existing independently replayed state/DMA stream, unchanged.
+    // This second stream adds exact post-filter, post-swap Q13 contributions
+    // and the same global frame/initialization epoch as the FM channel trace.
+    if (!configured || !nativeSBStateEnabled(c)) return;
+    static NativeChannelStates trace(sbTraceProfile);
     trace.record(c,phase,a,b,d,bufferStart,renderedStart);
 }
 struct NativeChannelStateScope {
@@ -291,10 +317,12 @@ struct NativeChannelStateScope {
         channel(ch),phase(p),a(x),b(y),c(z),fmBufferStart(uint32_t(ch->msbuffer_i)),fmRenderedStart(ch->rend_n) {
         nativeSBState(channel,phase,a,b,c);
         nativeFMState(channel,phase,a,b,c,fmBufferStart,fmRenderedStart);
+        nativeSBChannelState(channel,phase,a,b,c,fmBufferStart,fmRenderedStart);
     }
     ~NativeChannelStateScope() {
         nativeSBState(channel,phase+1,a,b,c);
         nativeFMState(channel,phase+1,a,b,c,fmBufferStart,fmRenderedStart);
+        nativeSBChannelState(channel,phase+1,a,b,c,fmBufferStart,fmRenderedStart);
     }
 };
 }
@@ -367,6 +395,7 @@ MixerChannel * MIXER_AddChannel(MIXER_Handler handler,Bitu freq,const char * nam
     mixer.channels=chan;
     nativeSBState(chan,0);
     nativeFMState(chan,0);
+    nativeSBChannelState(chan,0);
     return chan;
 }
 
