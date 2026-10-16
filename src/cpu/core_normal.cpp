@@ -47,6 +47,9 @@ extern bool ignore_opcode_63;
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <deque>
+#include <string>
+#include <utility>
 #include <vector>
 
 extern Bitu cycle_count;
@@ -63,6 +66,15 @@ struct NativeInstructionTrace {
     uint64_t trigger_eax_mask = 0, trigger_eax_value = 0;
     bool triggered = false;
     uint64_t limit = 0, instructions = 0, rows = 0, runs = 0;
+    uint64_t lookbehind = 0, history_count = 0, history_bytes = 0, first_id = 1, first_row = 0;
+    uint64_t trigger_counter = 0, retained_history = 0;
+    double trigger_pic = 0;
+    struct Pending {
+        uint64_t first_id = 0, first_row = 0, instructions = 0;
+        double pic = 0;
+        std::string text;
+    } pending;
+    std::deque<Pending> history;
     std::vector<uint64_t> stack;
 
     bool configure() {
@@ -76,6 +88,7 @@ struct NativeInstructionTrace {
         const char *duration = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRIGGER_DURATION_MS");
         const char *eax_mask = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRIGGER_EAX_MASK");
         const char *eax_value = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRIGGER_EAX_VALUE");
+        const char *history_limit = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_LOOKBEHIND");
         if (!path || !*path || !first || !last || !maximum) return false;
         char *tail = nullptr;
         start = std::strtod(first, &tail);
@@ -98,6 +111,10 @@ struct NativeInstructionTrace {
         }
         limit = std::strtoull(maximum, &tail, 10);
         if (!tail || *tail || !limit || limit > 1000000) return false;
+        if (history_limit) {
+            lookbehind = std::strtoull(history_limit, &tail, 10);
+            if (!trigger_address || !tail || *tail || !lookbehind || lookbehind > 16384 || lookbehind >= limit) return false;
+        }
         file = std::fopen(path, "wx");
         if (!file) return false;
         if (trigger_address) {
@@ -105,19 +122,67 @@ struct NativeInstructionTrace {
                          start, end, (unsigned long long)trigger_address, trigger_duration);
             if (trigger_eax_mask) std::fprintf(file, ",\"eax_mask\":%llu,\"eax_value\":%llu",
                 (unsigned long long)trigger_eax_mask, (unsigned long long)trigger_eax_value);
+            if (lookbehind) std::fprintf(file, ",\"lookbehind_instructions\":%llu", (unsigned long long)lookbehind);
             std::fputs("}\n", file);
         } else write_header();
         active = !std::ferror(file);
         return active;
     }
     void write_header() {
-        std::fprintf(file, "#DXINS001 {\"start_ms\":%.17g,\"end_ms\":%.17g,\"maximum_instructions\":%llu,\"entry_after_loop_debit\":1}\n",
+        std::fprintf(file, "#DXINS001 {\"start_ms\":%.17g,\"end_ms\":%.17g,\"maximum_instructions\":%llu,\"entry_after_loop_debit\":1",
                      start, end, (unsigned long long)limit);
+        if (lookbehind) std::fprintf(file, ",\"first_id\":%llu,\"first_row\":%llu,\"history_instructions\":%llu,\"trigger_counter\":%llu,\"trigger_pic_ms\":%.17g",
+            (unsigned long long)first_id, (unsigned long long)first_row, (unsigned long long)retained_history,
+            (unsigned long long)trigger_counter, trigger_pic);
+        std::fputs("}\n", file);
         std::fprintf(file, "row,id,parent,run,phase,pic_ms,cycle_count,cpu_cycles,cpu_cycle_left,cpu_cycle_max,cpu_io_delay_removed,cs,cs_base,eip,ss,ss_base,esp,stack_big,stack_mask,stack_notmask,code_big,pmode,cpl,if,raw_flags,eax,ebx,ecx,edx,esi,edi,ebp,ds,es,opcode_status,opcode_hex,outcome\n");
+    }
+    // Buffer whole outer decoder instructions, including nested scopes and
+    // auxiliary observations. Never discard a partial instruction group.
+    template <typename... Args> void emit(const char *format, Args... args) {
+        if (!lookbehind || triggered) { std::fprintf(file, format, args...); return; }
+        char line[2048];
+        const int length = std::snprintf(line, sizeof(line), format, args...);
+        if (length < 0 || size_t(length) >= sizeof(line) || pending.text.size() + size_t(length) > lookbehind * 4096) {
+            finish("history_byte_limit"); return;
+        }
+        pending.text.append(line, size_t(length));
+    }
+    void begin_pending() {
+        if (!lookbehind || triggered || !stack.empty()) return;
+        pending = Pending();
+        pending.first_id = instructions + 1; pending.first_row = rows;
+        pending.pic = double(PIC_FullIndex());
+    }
+    void complete_pending() {
+        if (!lookbehind || triggered || finished || !stack.empty()) return;
+        pending.instructions = instructions + 1 - pending.first_id;
+        if (pending.instructions > lookbehind) { finish("history_instruction_limit"); return; }
+        history_count += pending.instructions;
+        history_bytes += pending.text.size();
+        history.push_back(std::move(pending));
+        while (history_count > lookbehind || history_bytes > lookbehind * 4096) {
+            history_count -= history.front().instructions;
+            history_bytes -= history.front().text.size(); history.pop_front();
+        }
+    }
+    bool trigger(double now) {
+        if (!stack.empty()) { finish("trigger_inside_instruction"); return false; }
+        triggered = true; trigger_pic = now; trigger_counter = cycle_count;
+        first_id = history.empty() ? instructions + 1 : history.front().first_id;
+        first_row = history.empty() ? rows : history.front().first_row;
+        retained_history = history_count;
+        start = history.empty() ? now : history.front().pic; end = now + trigger_duration;
+        if (end - start > 1000) { finish("history_time_limit"); return false; }
+        write_header();
+        for (const auto &group : history) std::fwrite(group.text.data(), 1, group.text.size(), file);
+        history.clear(); history_count = 0; history_bytes = 0;
+        if (std::ferror(file)) { finish("io_error"); return false; }
+        return true;
     }
     void opl_read(Bitu port, Bitu width) {
         if (!active || finished || stack.empty()) return;
-        std::fprintf(file, "#DXOPL001 {\"id\":%llu,\"cycle_count\":%llu,\"pic_ms\":%.17g,\"cpu_cycles\":%lld,\"cpu_cycle_left\":%lld,\"cpu_cycle_max\":%lld,\"cpu_io_delay_removed\":%lld,\"port\":%u,\"width\":%u}\n",
+        emit("#DXOPL001 {\"id\":%llu,\"cycle_count\":%llu,\"pic_ms\":%.17g,\"cpu_cycles\":%lld,\"cpu_cycle_left\":%lld,\"cpu_cycle_max\":%lld,\"cpu_io_delay_removed\":%lld,\"port\":%u,\"width\":%u}\n",
             (unsigned long long)stack.back(), (unsigned long long)cycle_count, double(PIC_FullIndex()),
             (long long)CPU_Cycles, (long long)CPU_CycleLeft, (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved,
             unsigned(port), unsigned(width));
@@ -147,7 +212,7 @@ struct NativeInstructionTrace {
             if (status[0] != 'o') break;
         }
         if (status[0] != 'o') source_hex[0] = destination_hex[0] = 0;
-        std::fprintf(file, "#DXCMP001 {\"id\":%llu,\"cycle_count\":%llu,\"cpu_cycles\":%lld,\"cpu_cycle_left\":%lld,\"cpu_cycle_max\":%lld,\"cpu_io_delay_removed\":%lld,\"operand_size\":%u,\"count\":%llu,\"maximum_iterations\":%llu,\"source_base\":%u,\"destination_base\":%u,\"si\":%u,\"di\":%u,\"address_mask\":%u,\"step\":%d,\"repeat\":%u,\"repeat_equal\":%u,\"status\":\"%s\",\"source_hex\":\"%s\",\"destination_hex\":\"%s\"}\n",
+        emit("#DXCMP001 {\"id\":%llu,\"cycle_count\":%llu,\"cpu_cycles\":%lld,\"cpu_cycle_left\":%lld,\"cpu_cycle_max\":%lld,\"cpu_io_delay_removed\":%lld,\"operand_size\":%u,\"count\":%llu,\"maximum_iterations\":%llu,\"source_base\":%u,\"destination_base\":%u,\"si\":%u,\"di\":%u,\"address_mask\":%u,\"step\":%d,\"repeat\":%u,\"repeat_equal\":%u,\"status\":\"%s\",\"source_hex\":\"%s\",\"destination_hex\":\"%s\"}\n",
             (unsigned long long)stack.back(), (unsigned long long)cycle_count,
             (long long)CPU_Cycles, (long long)CPU_CycleLeft, (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved,
             size, (unsigned long long)count, (unsigned long long)bound, unsigned(source), unsigned(destination),
@@ -158,7 +223,7 @@ struct NativeInstructionTrace {
         if (!file || finished) return;
         finished = true; active = false;
         std::fprintf(file, "#DXINEND1 {\"reason\":\"%s\",\"rows\":%llu,\"instructions\":%llu,\"open\":%llu,\"pic_ms\":%.17g}\n",
-                     reason, (unsigned long long)rows, (unsigned long long)instructions,
+                     reason, (unsigned long long)(rows - first_row), (unsigned long long)(instructions + 1 - first_id),
                      (unsigned long long)stack.size(), double(PIC_FullIndex()));
         std::fflush(file);
     }
@@ -181,7 +246,7 @@ struct NativeInstructionTrace {
                 hex[i * 2] = digits[value >> 4]; hex[i * 2 + 1] = digits[value & 15];
             }
         }
-        std::fprintf(file, "%llu,%llu,%llu,%llu,%u,%.17g,%llu,%lld,%lld,%lld,%lld,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s\n",
+        emit("%llu,%llu,%llu,%llu,%u,%.17g,%llu,%lld,%lld,%lld,%lld,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s\n",
             (unsigned long long)rows++, (unsigned long long)id, (unsigned long long)parent, (unsigned long long)run,
             phase, double(PIC_FullIndex()), (unsigned long long)cycle_count,
             (long long)CPU_Cycles, (long long)CPU_CycleLeft, (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved,
@@ -208,16 +273,15 @@ struct NativeInstructionScope {
         if (trace.trigger_address && !trace.triggered) {
             if (now < trace.start) return;
             if (now >= trace.end) { trace.finish("trigger_not_reached"); return; }
-            if (uint64_t(SegPhys(cs)) + uint64_t(reg_eip) != trace.trigger_address) return;
-            if (trace.trigger_eax_mask && (uint64_t(reg_eax) & trace.trigger_eax_mask) != trace.trigger_eax_value) return;
-            trace.triggered = true;
-            trace.start = now;
-            trace.end = now + trace.trigger_duration;
-            trace.write_header();
+            const bool hit = uint64_t(SegPhys(cs)) + uint64_t(reg_eip) == trace.trigger_address &&
+                (!trace.trigger_eax_mask || (uint64_t(reg_eax) & trace.trigger_eax_mask) == trace.trigger_eax_value);
+            if (hit) { if (!trace.trigger(now)) return; }
+            else if (!trace.lookbehind) return;
         }
         if (now < trace.start) return;
         if (now >= trace.end && trace.stack.empty()) { trace.finish("window_complete"); return; }
-        if (trace.instructions >= trace.limit) { trace.finish("instruction_limit"); return; }
+        if ((!trace.trigger_address || trace.triggered) && trace.instructions + 1 - trace.first_id >= trace.limit) { trace.finish("instruction_limit"); return; }
+        trace.begin_pending();
         id = ++trace.instructions; run = run_id;
         parent = trace.stack.empty() ? 0 : trace.stack.back();
         trace.stack.push_back(id);
@@ -228,6 +292,7 @@ struct NativeInstructionScope {
         auto &trace = native_instruction_trace;
         trace.record(id, parent, run, 1, std::uncaught_exception() ? "cpp_unwind" : "normal");
         if (!trace.stack.empty()) trace.stack.pop_back();
+        trace.complete_pending();
     }
 };
 }
