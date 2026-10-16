@@ -81,6 +81,7 @@
 #include "mixer.h"
 #include "dma.h"
 #include "pic.h"
+#include "regs.h"
 #include "bios.h"
 #include "hardware.h"
 #include "control.h"
@@ -573,11 +574,13 @@ struct SB_INFO {
 	void ESSUpdateFilterFromSB(void);
 	void CTMIXER_UpdateVolumes(void);
 	void GenerateDMASound(Bitu size);
+	Bitu ReadNativeDMA(Bitu size, uint8_t *buffer, bool silent = false);
 	void sb16asp_next_RAM_byte(void);
 	void CTMIXER_Write(uint8_t val);
 	uint8_t ESS_DoRead(uint8_t reg);
 	void SB_RaiseIRQ(SB_IRQS type);
 	void TraceNativeIRQ(const char *event);
+	void TraceNativeDMAConfig(unsigned reason);
 	float calc_vol(uint8_t amount);
 	void DSP_AddData(uint8_t val);
 	void DSP_DoReset(uint8_t val);
@@ -792,7 +795,54 @@ void SB_INFO::DSP_FlushData(void) {
  *      --Jonathan C. */
 // Optional ordered witness of DMA completion and guest IRQ acknowledgement.
 // Read-only snapshots: DMA controller position is distinct from guest half state.
+void SB_INFO::TraceNativeDMAConfig(unsigned reason) {
+    struct Trace {
+        FILE *file=nullptr;
+        size_t bytes=0;
+        unsigned long long ordinal=0;
+        Trace() {
+            const char *path=getenv("DOSBOX_X_NATIVE_SB_CONFIG");
+            if(path && *path) {
+                file=fopen(path,"w");
+                if(file)bytes=fprintf(file,"ordinal,reason,card,command,mode,freq,dma_mode,left,total,autoinit,stereo,sign,remain,dac_mode,single_sample,dac_rate,channel,masked,page,base_address,address,base_count,count,controller_autoinit,increment\n");
+            }
+        }
+        ~Trace(){if(file)fclose(file);}
+    };
+    static Trace trace;
+    if(!trace.file)return;
+    if(trace.bytes+2048>64u*1024u*1024u) {
+        fputs("CAP\n",trace.file);fclose(trace.file);trace.file=nullptr;return;
+    }
+    // Reasons: 0=command entry, 1=DMA read entry, 2=DMA read exit,
+    // 3=transfer programmed, 4=end-of-block exit. Common ordinals, not time,
+    // join these read-only fields to command/payload/channel observations.
+    MIXER_NativeAudioEvent(20,"sb-config",trace.ordinal,reason);
+    const auto *c=dma.chan;
+    // Report pending count only: its buffer bytes need not be initialized to
+    // the width of a newly programmed format after a mode change.
+    const int n=fprintf(trace.file,"%llu,%u,%zu,%u,%u,%llu,%u,%llu,%llu,%u,%u,%u,%llu,%u,%u,%llu,%d,%u,%llu,%llu,%llu,%llu,%llu,%u,%u\n",
+        trace.ordinal++,reason,size_t(card_index),unsigned(dsp.cmd),unsigned(mode),
+        (unsigned long long)freq,unsigned(dma.mode),(unsigned long long)dma.left,
+        (unsigned long long)dma.total,unsigned(dma.autoinit),unsigned(dma.stereo),unsigned(dma.sign),
+        (unsigned long long)dma.remain_size,
+        unsigned(dma_dac_mode),unsigned(single_sample_dma),(unsigned long long)dma_dac_srcrate,
+        c ? int(c->channum) : -1,c ? unsigned(c->masked) : 0u,
+        c ? (unsigned long long)c->pagebase : 0,c ? (unsigned long long)c->baseaddr : 0,
+        c ? (unsigned long long)c->curraddr : 0,c ? (unsigned long long)c->basecnt : 0,
+        c ? (unsigned long long)c->currcnt : 0,c ? unsigned(c->autoinit) : 0u,
+        c ? unsigned(c->increment) : 0u);
+    if(n<0){fclose(trace.file);trace.file=nullptr;return;}
+    trace.bytes+=size_t(n);fflush(trace.file);
+}
+
 void SB_INFO::TraceNativeIRQ(const char *event) {
+    // Same ordered stream as mixer boundaries and execution snapshots. CPU
+    // coordinates are observations at the device callback, not an assumed
+    // guest ISR-entry/store timestamp. Guard the live opcode before deriving
+    // any driver code address from them.
+    if (MIXER_NativeAudioPhaseTracing())
+        MIXER_NativeAudioEvent(8,event,int64_t(SegValue(cs)),int64_t(reg_eip));
     struct Trace {
         FILE *file=nullptr;
         size_t bytes=0;
@@ -913,6 +963,24 @@ void SB_INFO::SB_OnEndOfDMA(void) {
 			mode=MODE_DMA_REQUIRE_IRQ_ACK;
 		}
 	}
+	TraceNativeDMAConfig(4);
+}
+
+Bitu SB_INFO::ReadNativeDMA(Bitu size, uint8_t *buffer, bool silent) {
+    TraceNativeDMAConfig(1);
+    if (!MIXER_NativeDMAPayloadTracing()) {
+        const Bitu result=dma.chan->Read(size,buffer);
+        TraceNativeDMAConfig(2);
+        return result;
+    }
+    const char *source = silent ? "sb-silent" : "sb-dma";
+    MIXER_NativeAudioEvent(11,source,dma.chan->channum,size);
+    MIXER_NativeAudioEvent(13,"sb-format",dma.mode,
+                          (dma.stereo ? 1 : 0) | (dma.sign ? 2 : 0) | (silent ? 4 : 0));
+    const Bitu result = dma.chan->Read(size,buffer);
+    MIXER_NativeAudioEvent(12,source,dma.chan->channum,result);
+    TraceNativeDMAConfig(2);
+    return result;
 }
 
 void SB_INFO::GenerateDMASound(Bitu size) {
@@ -1019,7 +1087,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 	else {
 		switch (dma.mode) {
 			case DSP_DMA_2:
-				read=dma.chan->Read(size,dma.buf.b8);
+				read=ReadNativeDMA(size,dma.buf.b8);
 				if (read && adpcm.haveref) {
 					adpcm.haveref=false;
 					adpcm.reference=dma.buf.b8[0];
@@ -1035,7 +1103,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 				chan->AddSamples_m8(done,MixTemp);
 				break;
 			case DSP_DMA_3:
-				read=dma.chan->Read(size,dma.buf.b8);
+				read=ReadNativeDMA(size,dma.buf.b8);
 				if (read && adpcm.haveref) {
 					adpcm.haveref=false;
 					adpcm.reference=dma.buf.b8[0];
@@ -1050,7 +1118,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 				chan->AddSamples_m8(done,MixTemp);
 				break;
 			case DSP_DMA_4:
-				read=dma.chan->Read(size,dma.buf.b8);
+				read=ReadNativeDMA(size,dma.buf.b8);
 				if (read && adpcm.haveref) {
 					adpcm.haveref=false;
 					adpcm.reference=dma.buf.b8[0];
@@ -1065,7 +1133,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 				break;
 			case DSP_DMA_8:
 				if (dma.stereo) {
-					read=dma.chan->Read(size,&dma.buf.b8[dma.remain_size]);
+					read=ReadNativeDMA(size,&dma.buf.b8[dma.remain_size]);
 					Bitu total=read+dma.remain_size;
 					if (!dma.sign)  chan->AddSamples_s8(total>>1,dma.buf.b8);
 					else chan->AddSamples_s8s(total>>1,(int8_t*)dma.buf.b8);
@@ -1074,7 +1142,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 						dma.buf.b8[0]=dma.buf.b8[total-1];
 					} else dma.remain_size=0;
 				} else {
-					read=dma.chan->Read(size,dma.buf.b8);
+					read=ReadNativeDMA(size,dma.buf.b8);
 					if (!dma.sign) chan->AddSamples_m8(read,dma.buf.b8);
 					else chan->AddSamples_m8s(read,(int8_t *)dma.buf.b8);
 				}
@@ -1085,7 +1153,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 					/* In DSP_DMA_16_ALIASED mode temporarily divide by 2 to get number of 16-bit
 					   samples, because 8-bit DMA Read returns byte size, while in DSP_DMA_16 mode
 					   16-bit DMA Read returns word size */
-					read=dma.chan->Read(size,(uint8_t *)&dma.buf.b16[dma.remain_size])
+					read=ReadNativeDMA(size,(uint8_t *)&dma.buf.b16[dma.remain_size])
 						>> (dma.mode==DSP_DMA_16_ALIASED ? 1:0);
 					Bitu total=read+dma.remain_size;
 #if defined(WORDS_BIGENDIAN)
@@ -1100,7 +1168,7 @@ void SB_INFO::GenerateDMASound(Bitu size) {
 						dma.buf.b16[0]=dma.buf.b16[total-1];
 					} else dma.remain_size=0;
 				} else {
-					read=dma.chan->Read(size,(uint8_t *)dma.buf.b16)
+					read=ReadNativeDMA(size,(uint8_t *)dma.buf.b16)
 						>> (dma.mode==DSP_DMA_16_ALIASED ? 1:0);
 #if defined(WORDS_BIGENDIAN)
 					if (dma.sign) chan->AddSamples_m16_nonnative(read,dma.buf.b16);
@@ -1279,6 +1347,7 @@ void SB_INFO::DSP_DoDMATransfer(DMA_MODES new_mode,Bitu freq,bool stereo,bool do
 	else {
 		LOG(LOG_SB,LOG_WARN)("DMA transfer initiated with no channel assigned");
 	}
+	TraceNativeDMAConfig(3);
 
 #if (C_DEBUG)
 	LOG(LOG_SB,LOG_NORMAL)("DMA Transfer:%s %s %s dsp %s dma %s freq %d rate %d dspsize %d dmasize %d gold %d",
@@ -1960,6 +2029,7 @@ void SB_INFO::DSP_DoCommand(void) {
 			std::ostringstream payload;
 			payload<<std::hex<<std::setfill('0');
 			for(size_t i=0;i<count;++i)payload<<std::setw(2)<<unsigned(data[i]);
+			MIXER_NativeAudioEvent(19,"sb-command",ordinal,command);
 			const int n=fprintf(file,"%llu,%zu,%.17g,%u,%s\n",ordinal++,card,
 				(double)PIC_FullIndex(),command,payload.str().c_str());
 			if(n<0){fclose(file);file=nullptr;return;}
@@ -1968,6 +2038,7 @@ void SB_INFO::DSP_DoCommand(void) {
 	};
 	static CommandTrace commandTrace;
 	commandTrace.record(card_index,dsp.cmd,dsp.in.data,dsp.in.pos);
+	TraceNativeDMAConfig(0);
 	LOG(LOG_SB,LOG_NORMAL)("DSP Command: 0x%02X", dsp.cmd);
 	if (ess_type != ESS_NONE && dsp.cmd >= 0xA0 && dsp.cmd <= 0xCF) {
 		// ESS overlap with SB16 commands. Handle it here, not mucking up the switch statement.
@@ -3755,7 +3826,7 @@ static void DMA_Silent_Event(Bitu val) {
 		(sb[ci].dma.chan != NULL) ?
 			(sb[ci].dma.recording ?
 				sb[ci].dma.chan->Write(val,sb[ci].dma.buf.b8) :
-				sb[ci].dma.chan->Read(val,sb[ci].dma.buf.b8)
+				sb[ci].ReadNativeDMA(val,sb[ci].dma.buf.b8,true)
 			) :
 			0;
 	sb[ci].dma.left-=read;
@@ -3820,7 +3891,7 @@ static void DMA_DAC_Event(Bitu val) {
 		L = R = 0;
 	}
 	else {
-		read = sb[ci].dma.chan->Read(expct,tmp);
+		read = sb[ci].ReadNativeDMA(expct,tmp);
 		//if (read != expct)
 		//      LOG_MSG("DMA read was not sample aligned. Sound may swap channels or become static. On real hardware the same may happen unless audio is prepared specifically.\n");
 

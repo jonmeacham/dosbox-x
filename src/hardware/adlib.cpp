@@ -1746,6 +1746,8 @@ Module::Module( Section* configuration ) : Module_base(configuration) {
 			break;
 	}
 
+	MIXER_NativeFMCheckpoint(mixerChan,uint32_t(oplmode),uint32_t(rate));
+
 	if (IS_PC98_ARCH) {
 		/* needs to match the low 8 bits */
 		assert(sb_addr != 0);

@@ -484,6 +484,8 @@ static void CaptureWavePICRecordCopy(Bitu frames, uint32_t source_rate) {
     capture.wave.pic_frame_offset += frames;
     if (written < 0 || fflush(capture.wave.pic_trace) != 0)
         CaptureWavePICFailure("copy row write");
+    else if (!capture.wave.pic_trace_failed && MIXER_NativeDMAPayloadTracing())
+        MIXER_NativeAudioEvent(15,"wav-copy",capture.wave.pic_frame_offset - frames,frames);
 }
 
 static void CaptureWavePICNoteDataWrite(size_t expected_bytes, int written) {
@@ -2040,6 +2042,9 @@ void CAPTURE_MultiTrackAddWave(uint32_t freq, uint32_t len, int16_t * data,const
                             CaptureMTWavePICFailure("AVI chunk rejection");
                         if (written < 0 || fflush(capture.multitrack_wave.pic_trace) != 0)
                             CaptureMTWavePICFailure("chunk write");
+                        else if (avi_written && !capture.multitrack_wave.pic_trace_failed &&
+                                 MIXER_NativeDMAPayloadTracing())
+                            MIXER_NativeAudioEvent(16,name,offset,len);
                     }
 				}
 				else {

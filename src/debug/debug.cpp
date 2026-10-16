@@ -52,6 +52,7 @@ using namespace std;
 #include "shell.h"
 #include "debug_inc.h"
 #include "../cpu/lazyflags.h"
+#include "mixer.h"
 #include "keyboard.h"
 #include "control.h"
 
@@ -2414,6 +2415,10 @@ static void delayed_exec_dump_arm(Bitu opaque) {
 		return;
 	}
 	request->armed = true;
+	if (MIXER_NativeAudioPhaseTracing()) {
+		MIXER_NativeAudioEvent(9,"exec-arm",request->id,request->linear_ip);
+		LOG_MSG("ADDEXECDUMP armed id=%u file='%s'",request->id,request->filename.c_str());
+	}
 }
 
 static ScheduledExecDumpRegs *find_scheduled_exec_dump_regs(const uint32_t id) {
@@ -2661,6 +2666,10 @@ static void capture_scheduled_exec_dumps() {
 			it = scheduled_exec_dumps.erase(it);
 			continue;
 		}
+		// Opt-in common-clock join to this successful binary snapshot. The
+		// per-request zero-based hit indexes its DXEXE001 register/memory record.
+		if (MIXER_NativeAudioPhaseTracing())
+			MIXER_NativeAudioEvent(7,"exec",request.id,request.hits);
 		if (++request.hits >= request.max_hits) {
 			close_scheduled_exec_dump(request);
 			it = scheduled_exec_dumps.erase(it);
