@@ -67,6 +67,7 @@ public:
     explicit NativeCallbackScope(const char *kind, Bitu callback = 0);
     ~NativeCallbackScope();
     void mark(const char *stage, Bitu result = 0);
+    uint64_t observedID() const { return id; }
     NativeCallbackScope(const NativeCallbackScope &) = delete;
     NativeCallbackScope &operator=(const NativeCallbackScope &) = delete;
 };

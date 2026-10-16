@@ -654,6 +654,10 @@ static void AddEntry(PICEntry * entry) {
 static bool InEventService = false;
 static pic_tickindex_t srv_lag = 0;
 
+#if C_DEBUG
+#include "native_pic_queue_trace.h"
+#endif
+
 pic_tickindex_t PIC_GetCurrentEventTime(void) {
     if (InEventService)
         return (pic_tickindex_t)PIC_Ticks + srv_lag;
@@ -662,11 +666,18 @@ pic_tickindex_t PIC_GetCurrentEventTime(void) {
 }
 
 void PIC_AddEvent(PIC_EventHandler handler,pic_tickindex_t delay,Bitu val) {
+#if C_DEBUG
+    NativeCallbackScope raw_scope("pic_add");
+    NativePICQueueScope queue_scope(raw_scope, "pic_add", handler, delay, val);
+#endif
     if (GCC_UNLIKELY(!pic_queue.free_entry)) {
         LOG(LOG_PIC,LOG_ERROR)("Event queue full");
         return;
     }
     PICEntry * entry=pic_queue.free_entry;
+#if C_DEBUG
+    queue_scope.entry = entry;
+#endif
     if(InEventService) entry->index = delay + srv_lag;
     else entry->index = delay + PIC_TickIndex();
 
@@ -677,6 +688,10 @@ void PIC_AddEvent(PIC_EventHandler handler,pic_tickindex_t delay,Bitu val) {
 }
 
 void PIC_RemoveSpecificEvents(PIC_EventHandler handler, Bitu val) {
+#if C_DEBUG
+    NativeCallbackScope raw_scope("pic_remove_specific");
+    NativePICQueueScope queue_scope(raw_scope, "pic_remove_specific", handler, 0, val);
+#endif
     PICEntry * entry=pic_queue.next_entry;
     PICEntry * prev_entry = nullptr;
     while (entry) {
@@ -701,6 +716,10 @@ void PIC_RemoveSpecificEvents(PIC_EventHandler handler, Bitu val) {
 }
 
 void PIC_RemoveEvents(PIC_EventHandler handler) {
+#if C_DEBUG
+    NativeCallbackScope raw_scope("pic_remove");
+    NativePICQueueScope queue_scope(raw_scope, "pic_remove", handler);
+#endif
     PICEntry * entry=pic_queue.next_entry;
     PICEntry * prev_entry = nullptr;
     while (entry) {
@@ -738,6 +757,7 @@ bool PIC_RunQueue(void) {
 #endif
 #if C_DEBUG
     NativeCallbackScope queue_trace("pic_queue");
+    NativePICQueueScope queue_snapshot(queue_trace, "pic_queue");
 #endif
 #ifdef DEBUG_CPU_CYCLE_OVERRUN
     /* I/O delay can cause negative CPU_Cycles and PIC event / audio rendering issues */
@@ -766,17 +786,30 @@ bool PIC_RunQueue(void) {
 
         /* Check the queue for an entry */
         Bits index_nd=PIC_TickIndexND();
+#if C_DEBUG
+        queue_snapshot.freeze(index_nd);
+#endif
         InEventService = true;
         while (pic_queue.next_entry && (pic_queue.next_entry->index*CPU_CycleMax<=index_nd)) {
             PICEntry * entry=pic_queue.next_entry;
+#if C_DEBUG
+            NativeCallbackScope fire_trace("pic_fire");
+            NativePICQueueScope fire_snapshot(fire_trace, "pic_fire", entry->pic_event, 0, entry->value, entry, true, index_nd);
+#endif
             pic_queue.next_entry=entry->next;
             srv_lag = entry->index;
+#if C_DEBUG
+            fire_trace.mark("dequeued"); fire_snapshot.mark("dequeued");
+#endif
 
             if (entry->pic_event != NULL)
                 (entry->pic_event)(entry->value); // call the event handler
             else
                 LOG(LOG_MISC,LOG_WARN)("PIC: Event in queue with NULL handler"); // This can happen after save state / load state
 
+#if C_DEBUG
+            fire_trace.mark("handler_return"); fire_snapshot.mark("handler_return");
+#endif
             /* Put the entry in the free list */
             entry->next=pic_queue.free_entry;
             pic_queue.free_entry=entry;
@@ -863,6 +896,7 @@ extern void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused
 void TIMER_AddTick(void) {
 #if C_DEBUG
     NativeCallbackScope tick_trace("timer_tick");
+    NativePICQueueScope tick_snapshot(tick_trace, "timer_tick");
 #endif
     /* Setup new amount of cycles for PIC */
     PIC_Ticks++;
@@ -877,6 +911,7 @@ void TIMER_AddTick(void) {
     CPU_Cycles = 0;
 #if C_DEBUG
     tick_trace.mark("replenished");
+    tick_snapshot.mark("replenished");
 #endif
 
     /* timeout */
@@ -891,6 +926,9 @@ void TIMER_AddTick(void) {
     }
 
     /* Call our list of ticker handlers */
+#if C_DEBUG
+    tick_snapshot.mark("decremented");
+#endif
     TickerBlock * ticker=firstticker;
     while (ticker) {
         TickerBlock * nextticker=ticker->next;
@@ -905,6 +943,9 @@ static IO_ReadHandleObject ReadHandler[4];
 static IO_WriteHandleObject WriteHandler[4];
 
 void PIC_Reset(Section *sec) {
+#if C_DEBUG
+    native_pic_queue_trace().epoch_change();
+#endif
     (void)sec;//UNUSED
 
     ReadHandler[0].Uninstall();
@@ -1059,6 +1100,9 @@ void PIC_Destroy(Section* sec) {
 }
 
 void Init_PIC() {
+#if C_DEBUG
+    native_pic_queue_trace().epoch_change();
+#endif
     Bitu i;
 
     LOG(LOG_MISC,LOG_DEBUG)("Init_PIC()");
@@ -1384,6 +1428,9 @@ private:
 
     void setBytes(std::istream& stream) override
     {
+#if C_DEBUG
+        native_pic_queue_trace().epoch_change();
+#endif
 				uint16_t free_idx, next_idx;
 				uint16_t ticker_size;
 
