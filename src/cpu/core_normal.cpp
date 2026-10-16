@@ -43,6 +43,114 @@ extern bool ignore_opcode_63;
 
 #if C_DEBUG
 #include "debug.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <vector>
+
+extern Bitu cycle_count;
+namespace {
+// Diagnostic only: preserve the normal decoder's actual one-unit loop debit,
+// including all additional REP/I/O/control effects inside each instruction.
+// Raw EFLAGS are retained without materializing or changing lazy arithmetic flags.
+struct NativeInstructionTrace {
+    bool configured = false, active = false, finished = false;
+    FILE *file = nullptr;
+    double start = 0, end = 0;
+    uint64_t limit = 0, instructions = 0, rows = 0, runs = 0;
+    std::vector<uint64_t> stack;
+
+    bool configure() {
+        if (configured) return active;
+        configured = true;
+        const char *path = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_TRACE");
+        const char *first = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_START_MS");
+        const char *last = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_END_MS");
+        const char *maximum = std::getenv("DOSBOX_X_NATIVE_INSTRUCTION_MAX");
+        if (!path || !*path || !first || !last || !maximum) return false;
+        char *tail = nullptr;
+        start = std::strtod(first, &tail);
+        if (!tail || *tail || !std::isfinite(start) || start < 0) return false;
+        end = std::strtod(last, &tail);
+        if (!tail || *tail || !std::isfinite(end) || end <= start || end - start > 1000 || end > 600000) return false;
+        limit = std::strtoull(maximum, &tail, 10);
+        if (!tail || *tail || !limit || limit > 1000000) return false;
+        file = std::fopen(path, "wx");
+        if (!file) return false;
+        std::fprintf(file, "#DXINS001 {\"start_ms\":%.17g,\"end_ms\":%.17g,\"maximum_instructions\":%llu,\"entry_after_loop_debit\":1}\n",
+                     start, end, (unsigned long long)limit);
+        std::fprintf(file, "row,id,parent,run,phase,pic_ms,cycle_count,cpu_cycles,cpu_cycle_left,cpu_cycle_max,cpu_io_delay_removed,cs,cs_base,eip,ss,ss_base,esp,stack_big,stack_mask,stack_notmask,code_big,pmode,cpl,if,raw_flags,eax,ebx,ecx,edx,esi,edi,ebp,ds,es,opcode_status,opcode_hex,outcome\n");
+        active = !std::ferror(file);
+        return active;
+    }
+    void finish(const char *reason) {
+        if (!file || finished) return;
+        finished = true; active = false;
+        std::fprintf(file, "#DXINEND1 {\"reason\":\"%s\",\"rows\":%llu,\"instructions\":%llu,\"open\":%llu,\"pic_ms\":%.17g}\n",
+                     reason, (unsigned long long)rows, (unsigned long long)instructions,
+                     (unsigned long long)stack.size(), double(PIC_FullIndex()));
+        std::fflush(file);
+    }
+    ~NativeInstructionTrace() {
+        if (file) { finish("process_exit"); std::fclose(file); }
+    }
+    void record(uint64_t id, uint64_t parent, uint64_t run, unsigned phase, const char *outcome) {
+        if (!file || finished) return;
+        char hex[33] = {};
+        const char *status = "exit";
+        if (!phase) {
+            status = "ok";
+            const uint64_t address = uint64_t(SegPhys(cs)) + uint64_t(reg_eip);
+            static const char digits[] = "0123456789abcdef";
+            for (unsigned i = 0; i < 16; ++i) {
+                uint8_t value = 0;
+                if (address + i > UINT32_MAX || mem_readb_checked(LinearPt(address + i), &value)) {
+                    status = "unreadable"; hex[0] = 0; break;
+                }
+                hex[i * 2] = digits[value >> 4]; hex[i * 2 + 1] = digits[value & 15];
+            }
+        }
+        std::fprintf(file, "%llu,%llu,%llu,%llu,%u,%.17g,%llu,%lld,%lld,%lld,%lld,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s\n",
+            (unsigned long long)rows++, (unsigned long long)id, (unsigned long long)parent, (unsigned long long)run,
+            phase, double(PIC_FullIndex()), (unsigned long long)cycle_count,
+            (long long)CPU_Cycles, (long long)CPU_CycleLeft, (long long)CPU_CycleMax, (long long)CPU_IODelayRemoved,
+            unsigned(SegValue(cs)), unsigned(SegPhys(cs)), unsigned(reg_eip), unsigned(SegValue(ss)), unsigned(SegPhys(ss)), unsigned(reg_esp),
+            unsigned(cpu.stack.big), unsigned(cpu.stack.mask), unsigned(cpu.stack.notmask), unsigned(cpu.code.big), unsigned(cpu.pmode), unsigned(cpu.cpl),
+            unsigned((reg_flags & FLAG_IF) != 0), unsigned(reg_flags), unsigned(reg_eax), unsigned(reg_ebx), unsigned(reg_ecx), unsigned(reg_edx),
+            unsigned(reg_esi), unsigned(reg_edi), unsigned(reg_ebp), unsigned(SegValue(ds)), unsigned(SegValue(es)), status, hex, outcome);
+        if (std::ferror(file)) finish("io_error");
+    }
+} native_instruction_trace;
+
+struct NativeInstructionRun {
+    uint64_t id = 0;
+    NativeInstructionRun() {
+        if (native_instruction_trace.configure()) id = ++native_instruction_trace.runs;
+    }
+};
+struct NativeInstructionScope {
+    uint64_t id = 0, parent = 0, run = 0;
+    explicit NativeInstructionScope(uint64_t run_id) {
+        auto &trace = native_instruction_trace;
+        if (!trace.active) return;
+        const double now = double(PIC_FullIndex());
+        if (now < trace.start) return;
+        if (now >= trace.end && trace.stack.empty()) { trace.finish("window_complete"); return; }
+        if (trace.instructions >= trace.limit) { trace.finish("instruction_limit"); return; }
+        id = ++trace.instructions; run = run_id;
+        parent = trace.stack.empty() ? 0 : trace.stack.back();
+        trace.stack.push_back(id);
+        trace.record(id, parent, run, 0, "entry");
+    }
+    ~NativeInstructionScope() {
+        if (!id) return;
+        auto &trace = native_instruction_trace;
+        trace.record(id, parent, run, 1, std::uncaught_exception() ? "cpp_unwind" : "normal");
+        if (!trace.stack.empty()) trace.stack.pop_back();
+    }
+};
+}
 #endif
 
 #define LoadMb(off) mem_readb_inline(off)
@@ -161,6 +269,10 @@ Bits CPU_Core_Normal_Run(void) {
 	if (CPU_Cycles <= 0)
 		return CBRET_NONE;
 
+#if C_DEBUG
+    const NativeInstructionRun instruction_run;
+#endif
+
 	while (CPU_Cycles-->0) {
 		LOADIP;
 		last_prefix=MP_NONE;
@@ -180,6 +292,9 @@ Bits CPU_Core_Normal_Run(void) {
 #endif
 #endif
 		cycle_count++;
+#if C_DEBUG
+        const NativeInstructionScope instruction_scope(instruction_run.id);
+#endif
 restart_opcode:
 		switch (core.opcode_index+Fetchb()) {
 		#include "core_normal/prefix_none.h"
