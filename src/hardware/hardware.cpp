@@ -469,6 +469,10 @@ static void CaptureWavePICOpen(const std::string &wav_path) {
 static void CaptureWavePICRecordCopy(Bitu frames, uint32_t source_rate) {
     if (capture.wave.pic_trace == NULL)
         return;
+#if C_DEBUG
+    MIXER_NativeCursorEvent("wav-copy",0,0,capture.wave.pic_frame_offset,
+                           static_cast<uint32_t>(frames));
+#endif
     const char *status = source_rate == capture.wave.freq ? "" : "source_rate_mismatch";
     if (status[0] != 0)
         CaptureWavePICFailure("source rate changed during capture");

@@ -37,6 +37,7 @@ using namespace std;
 #include "fpu.h"
 #include "bios.h"
 #include "hardware.h"
+#include "mixer.h"
 #include "timer.h"
 #include "video.h"
 #include "vga.h"
@@ -2574,6 +2575,7 @@ static void capture_scheduled_exec_dump_regs() {
 			it = scheduled_exec_dump_regs.erase(it);
 			continue;
 		}
+		MIXER_NativeCursorEvent("execution-snapshot",linear_ip,address,0,0);
 		if (++request.hits >= request.max_hits) {
 			finish_scheduled_exec_dump_regs(request,2);
 			it = scheduled_exec_dump_regs.erase(it);

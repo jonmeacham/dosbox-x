@@ -153,4 +153,10 @@ void PCSPEAKER_SetPITControl(Bitu mode);
 // Opt-in total-order native audio event evidence (not a playback API).
 void MIXER_NativeAudioEvent(unsigned kind, const char *source, int64_t a=0, int64_t b=0);
 
+#if C_DEBUG
+// Debug evidence: committed mix prefix, not channel generation or device delivery.
+void MIXER_NativeCursorEvent(const char *kind, uint32_t ip, uint32_t subject,
+                            uint64_t capture_frame, uint32_t frames);
+#endif
+
 #endif

@@ -752,8 +752,72 @@ static inline bool Mixer_irq_important(void) {
 unsigned long long mixer_sample_counter = 0;
 double mixer_start_pic_time = 0;
 
+#if C_DEBUG
+namespace {
+unsigned native_mixer_mix_depth = 0;
+struct NativeMixerMixScope {
+    NativeMixerMixScope() { ++native_mixer_mix_depth; }
+    ~NativeMixerMixScope() { --native_mixer_mix_depth; }
+};
+struct NativeMixerCursorTrace {
+    FILE *file = nullptr;
+    unsigned long long ordinal = 0;
+    size_t bytes = 0;
+    bool failed = false;
+    NativeMixerCursorTrace() {
+        const char *path = getenv("DOSBOX_X_NATIVE_MIXER_CURSOR_TRACE");
+        if (!path || !*path) return;
+        file = fopen(path,"wx");
+        if (!file) {
+            LOG_MSG("Native mixer cursor trace cannot create '%s'",path);
+            return;
+        }
+        const int written = fprintf(file,
+            "# DOSBOX-X native mixer cursor v1\n"
+            "ordinal,kind,ip,subject_address,pic_ms,mixer_frame_counter,mixer_epoch_pic_ms,mix_depth,sample_rate,cell_rendered_frames,cell_total_frames,capture_frame_offset,frame_count\n");
+        failed = written < 0 || fflush(file) != 0;
+        if (written > 0) bytes = static_cast<size_t>(written);
+    }
+    ~NativeMixerCursorTrace() {
+        if (!file) return;
+        fprintf(file,"# %s,rows=%llu\n",failed ? "incomplete" : "complete",ordinal);
+        if (fclose(file) != 0)
+            LOG_MSG("Native mixer cursor trace close failed");
+    }
+    void record(const char *kind, uint32_t ip, uint32_t subject,
+                uint64_t capture_frame, uint32_t frames) {
+        if (!file || failed) return;
+        if (ordinal >= 1000000ULL || bytes + 512u > 128u * 1024u * 1024u) {
+            failed = true;
+            return;
+        }
+        const int written = fprintf(file,
+            "%llu,%s,%u,%u,%.17g,%llu,%.17g,%u,%u,%u,%u,%llu,%u\n",
+            ordinal,kind,ip,subject,(double)PIC_FullIndex(),mixer_sample_counter,
+            mixer_start_pic_time,native_mixer_mix_depth,(unsigned)mixer.freq,
+            mixer.samples_rendered_ms.w,mixer.samples_this_ms.w,
+            (unsigned long long)capture_frame,frames);
+        if (written < 0 || fflush(file) != 0) {
+            failed = true;
+            return;
+        }
+        bytes += static_cast<size_t>(written);
+        ++ordinal;
+    }
+};
+}
+void MIXER_NativeCursorEvent(const char *kind, uint32_t ip, uint32_t subject,
+                            uint64_t capture_frame, uint32_t frames) {
+    static NativeMixerCursorTrace trace;
+    trace.record(kind,ip,subject,capture_frame,frames);
+}
+#endif
+
 /* once a millisecond, render 1ms of audio, up to whole samples */
 static void MIXER_MixData(Bitu fracs/*render up to*/) {
+#if C_DEBUG
+    NativeMixerMixScope native_mix_scope;
+#endif
     unsigned int prev_rendered = mixer.samples_rendered_ms.w;
     MixerChannel *chan = mixer.channels;
     unsigned int whole,frac;
