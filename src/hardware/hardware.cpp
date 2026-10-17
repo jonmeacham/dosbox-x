@@ -1939,6 +1939,13 @@ void CAPTURE_AddWave(uint32_t freq, uint32_t len, int16_t * data) {
 #endif
 			LOG_MSG("Started capturing wave output to: %s", path.c_str());
 		}
+#if C_DEBUG
+        // Header/format setup has succeeded. These are accepted copy frames,
+        // including data still buffered before the next WAV flush. Keep all
+        // original sample, buffer and gain operations below unchanged.
+        MIXER_NativeCursorEvent("wav-copy",0,0,
+            uint64_t(capture.wave.length) / 4u + uint64_t(capture.wave.used),len);
+#endif
 		int16_t * read = data;
 		while (len > 0 ) {
 			Bitu left = WAVE_BUF - capture.wave.used;

@@ -48,6 +48,7 @@ using namespace std;
 #include "inout.h"
 #include "paging.h"
 #include "pic.h"
+#include "mixer.h"
 #include "shell.h"
 #include "debug_inc.h"
 #include "../cpu/lazyflags.h"
@@ -2454,6 +2455,10 @@ static void capture_scheduled_exec_dumps() {
 			it = scheduled_exec_dumps.erase(it);
 			continue;
 		}
+        // Same instruction/snapshot as the successfully written observation.
+        // The original guest cue path, not a host UI timestamp, owns this row.
+        MIXER_NativeCursorEvent("execution-snapshot",linear_ip,
+                               request.snapshot_address,0,0);
 		if (++request.hits >= request.max_hits) {
 			close_scheduled_exec_dump(request);
 			it = scheduled_exec_dumps.erase(it);

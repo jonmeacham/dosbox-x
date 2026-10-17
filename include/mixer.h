@@ -153,4 +153,11 @@ void PCSPEAKER_SetPITControl(Bitu mode);
 // Opt-in total-order native audio event evidence (not a playback API).
 void MIXER_NativeAudioEvent(unsigned kind, const char *source, int64_t a=0, int64_t b=0);
 
+#if C_DEBUG
+// Optional read-only committed-prefix evidence. No channel generation or
+// device-delivery timestamp is inferred from these cursors.
+void MIXER_NativeCursorEvent(const char *kind, uint32_t ip, uint32_t subject,
+                            uint64_t capture_frame, uint32_t frames);
+#endif
+
 #endif
