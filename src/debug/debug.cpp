@@ -2400,7 +2400,94 @@ static uint32_t scheduled_exec_dump_register_value(const ScheduledExecDump &requ
 	return reg_esp;
 }
 
+// Shared by the debugger command and optional startup observation. Only
+// bounded read-only snapshots are queued; this never sends guest input.
+static bool queue_scheduled_exec_dump(const std::string &original_str) {
+	std::istringstream original_stream(original_str);
+	std::string original_command, delay_text, duration_text, ip_text;
+	std::string register_name, register_value_text, hits_text;
+	std::string address_text, length_text, filename, trailing;
+	original_stream >> original_command >> delay_text >> duration_text >> ip_text
+	                >> register_name >> register_value_text >> hits_text
+	                >> address_text >> length_text >> filename;
+	bool valid = !original_stream.fail() && !(original_stream >> trailing);
+	uint64_t delay = 0, duration = 0, linear_ip = 0, register_value = 0;
+	uint64_t max_hits = 0, snapshot_address = 0, length = 0;
+	auto parse_number = [](const std::string &text, const int base,
+	                       uint64_t &value) {
+		if (text.empty() || text.front() == '-' || text.front() == '+') return false;
+		try {
+		size_t used = 0;
+		value = std::stoull(text,&used,base);
+		return used == text.size();
+		} catch (...) {
+		return false;
+		}
+	};
+	valid = valid && parse_number(delay_text,10,delay) && delay <= 600000;
+	valid = valid && parse_number(duration_text,10,duration) && duration >= 1 &&
+	        duration <= 600000;
+	valid = valid && parse_number(ip_text,16,linear_ip) && linear_ip <= UINT32_MAX;
+	valid = valid && parse_number(register_value_text,16,register_value) &&
+	        register_value <= UINT32_MAX;
+	valid = valid && parse_number(hits_text,10,max_hits) && max_hits >= 1 &&
+	        max_hits <= 4096;
+	valid = valid && (register_name == "EAX" || register_name == "EBX" ||
+	                  register_name == "ECX" || register_name == "EDX" ||
+	                  register_name == "ESI" || register_name == "EDI" ||
+	                  register_name == "EBP" || register_name == "ESP" ||
+                          (register_name == "ANY" && register_value == 0));
+	valid = valid && ParseScheduledAddress(address_text,snapshot_address,true);
+	valid = valid && parse_number(length_text,16,length) && length >= 1 &&
+	        length <= 65536 && (max_hits * length <= 64u * 1024u * 1024u);
+	valid = valid && uint64_t(snapshot_address) + length <= (uint64_t(UINT32_MAX) + 1u);
+#if !C_HEAVY_DEBUG
+	LOG_MSG("DEBUG: ADDEXECDUMP requires a heavy-debug build.\n");
+	valid = false;
+#endif
+	if (cpudecoder != &CPU_Core_Normal_Run) {
+		LOG_MSG("DEBUG: ADDEXECDUMP requires the normal CPU core.\n");
+		valid = false;
+	}
+	if (!valid) {
+		LOG_MSG("DEBUG: ADDEXECDUMP syntax: delay-ms duration-ms "
+		              "linear-ip register(EAX..ESP/ANY) hex-value(0-for-ANY) max-hits segment:offset "
+		              "hex-length filename.\n");
+		return false;
+	}
+	ScheduledExecDump request;
+	request.id = next_scheduled_exec_dump_id++;
+	if (request.id == 0) request.id = next_scheduled_exec_dump_id++;
+	request.snapshot_address = static_cast<uint32_t>(snapshot_address);
+	request.length = static_cast<uint32_t>(length);
+	request.linear_ip = static_cast<uint32_t>(linear_ip);
+	request.register_name = register_name;
+	request.register_value = static_cast<uint32_t>(register_value);
+	request.max_hits = static_cast<uint32_t>(max_hits);
+	request.filename = filename;
+	const auto id = request.id;
+	scheduled_exec_dumps.push_back(std::move(request));
+	PIC_AddEvent(&delayed_exec_dump_arm,static_cast<double>(delay),id);
+	PIC_AddEvent(&delayed_exec_dump_timeout,
+	             static_cast<double>(delay + duration),id);
+	LOG_MSG("DEBUG: Queued guest-clock execution dump.\n");
+	return true;
+}
+
 static void capture_scheduled_exec_dumps() {
+    static bool startup_checked = false;
+    if (!startup_checked) {
+        startup_checked = true;
+        const char *spec = getenv("DOSBOX_X_STARTUP_EXECDUMP");
+        if (spec && *spec) {
+            // Same syntax/bounds as ADDEXECDUMP, excluding its command name.
+            // Limit the environment string before parsing or allocating it.
+            if (strlen(spec) > 1024 ||
+                !queue_scheduled_exec_dump(std::string("ADDEXECDUMP ") + spec))
+                LOG_MSG("Startup execution snapshot request rejected");
+        }
+    }
+
 	if (scheduled_exec_dumps.empty()) return;
 	const uint32_t linear_ip = static_cast<uint32_t>(SegPhys(cs) + reg_eip);
 	for (auto it = scheduled_exec_dumps.begin();
@@ -3618,75 +3705,8 @@ bool ParseCommand(char* str) {
 	}
 
 	if (command == "ADDEXECDUMP") {
-		std::istringstream original_stream(original_str);
-		std::string original_command, delay_text, duration_text, ip_text;
-		std::string register_name, register_value_text, hits_text;
-		std::string address_text, length_text, filename, trailing;
-		original_stream >> original_command >> delay_text >> duration_text >> ip_text
-		                >> register_name >> register_value_text >> hits_text
-		                >> address_text >> length_text >> filename;
-		bool valid = !original_stream.fail() && !(original_stream >> trailing);
-		uint64_t delay = 0, duration = 0, linear_ip = 0, register_value = 0;
-		uint64_t max_hits = 0, snapshot_address = 0, length = 0;
-		auto parse_number = [](const std::string &text, const int base,
-		                       uint64_t &value) {
-			if (text.empty() || text.front() == '-' || text.front() == '+') return false;
-			try {
-				size_t used = 0;
-				value = std::stoull(text,&used,base);
-				return used == text.size();
-			} catch (...) {
-				return false;
-			}
-		};
-		valid = valid && parse_number(delay_text,10,delay) && delay <= 600000;
-		valid = valid && parse_number(duration_text,10,duration) && duration >= 1 &&
-		        duration <= 600000;
-		valid = valid && parse_number(ip_text,16,linear_ip) && linear_ip <= UINT32_MAX;
-		valid = valid && parse_number(register_value_text,16,register_value) &&
-		        register_value <= UINT32_MAX;
-		valid = valid && parse_number(hits_text,10,max_hits) && max_hits >= 1 &&
-		        max_hits <= 4096;
-		valid = valid && (register_name == "EAX" || register_name == "EBX" ||
-		                  register_name == "ECX" || register_name == "EDX" ||
-		                  register_name == "ESI" || register_name == "EDI" ||
-		                  register_name == "EBP" || register_name == "ESP" ||
-                          (register_name == "ANY" && register_value == 0));
-		valid = valid && ParseScheduledAddress(address_text,snapshot_address,true);
-		valid = valid && parse_number(length_text,16,length) && length >= 1 &&
-		        length <= 65536 && (max_hits * length <= 64u * 1024u * 1024u);
-		valid = valid && uint64_t(snapshot_address) + length <= (uint64_t(UINT32_MAX) + 1u);
-#if !C_HEAVY_DEBUG
-		DEBUG_ShowMsg("DEBUG: ADDEXECDUMP requires a heavy-debug build.\n");
-		valid = false;
-#endif
-		if (cpudecoder != &CPU_Core_Normal_Run) {
-			DEBUG_ShowMsg("DEBUG: ADDEXECDUMP requires the normal CPU core.\n");
-			valid = false;
-		}
-		if (!valid) {
-			DEBUG_ShowMsg("DEBUG: ADDEXECDUMP syntax: delay-ms duration-ms "
-			              "linear-ip register(EAX..ESP/ANY) hex-value(0-for-ANY) max-hits segment:offset "
-			              "hex-length filename.\n");
-			return true;
-		}
-		ScheduledExecDump request;
-		request.id = next_scheduled_exec_dump_id++;
-		if (request.id == 0) request.id = next_scheduled_exec_dump_id++;
-		request.snapshot_address = static_cast<uint32_t>(snapshot_address);
-		request.length = static_cast<uint32_t>(length);
-		request.linear_ip = static_cast<uint32_t>(linear_ip);
-		request.register_name = register_name;
-		request.register_value = static_cast<uint32_t>(register_value);
-		request.max_hits = static_cast<uint32_t>(max_hits);
-		request.filename = filename;
-		const auto id = request.id;
-		scheduled_exec_dumps.push_back(std::move(request));
-		PIC_AddEvent(&delayed_exec_dump_arm,static_cast<double>(delay),id);
-		PIC_AddEvent(&delayed_exec_dump_timeout,
-		             static_cast<double>(delay + duration),id);
-		DEBUG_ShowMsg("DEBUG: Queued guest-clock execution dump.\n");
-		return true;
+        queue_scheduled_exec_dump(original_str);
+        return true;
 	}
 
 	if (command == "RUNWATCH") {
