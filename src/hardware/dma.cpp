@@ -25,6 +25,7 @@
 #include "dma.h"
 #include "pic.h"
 #include "paging.h"
+#include "mixer.h"
 #include "setup.h"
 #include "control.h"
 
@@ -121,6 +122,15 @@ template <const unsigned int dma_mode> static void DMA_BlockRead4KB(const PhysPt
         assert((o_size & 1u) == 0);
         assert((xfer   & 1u) == 0);
         for ( ; o_size ; o_size -= 2, (dma_mode == DMA_DECREMENT ? (xfer -= 2) : (xfer += 2)), write += 2 ) host_writew(write,phys_readw(xfer));
+    }
+    // Capture only after the original transfer; do not reread guest memory.
+    if (MIXER_NativeDMAPayloadTracing()) {
+        PhysPt start;
+        unsigned int bytes;
+        DMA_BlockReadCommonSetup<dma_mode>(start,bytes,spage,offset,size,dma16,DMA16_ADDRMASK);
+        MIXER_NativeDMAPayload(static_cast<uint32_t>(start),1u << dma16,
+                              dma_mode == DMA_DECREMENT,
+                              static_cast<const uint8_t *>(data),bytes);
     }
 }
 

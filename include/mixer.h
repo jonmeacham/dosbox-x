@@ -151,7 +151,20 @@ void PCSPEAKER_SetType(bool pit_clock_gate_enabled, bool pit_output_enabled);
 void PCSPEAKER_SetPITControl(Bitu mode);
 
 // Opt-in total-order native audio event evidence (not a playback API).
+// Diagnostic common-clock kinds 7/8/9: successful execution snapshot
+// (request id, zero-based hit) / SB IRQ event (observed CS, EIP) /
+// execution snapshot armed (request id, linear IP). The arm log names its file.
+// Additional phase kinds require DOSBOX_X_NATIVE_AUDIO_PHASE_TRACE=1; existing
+// event consumers retain their original stream when it is absent.
+bool MIXER_NativeAudioPhaseTracing();
+// Optional bounded raw DMA evidence: actual mapped physical address and bytes.
+// Requires phase tracing plus DOSBOX_X_NATIVE_DMA_PAYLOADS and AUDIO_EVENTS.
+bool MIXER_NativeDMAPayloadTracing();
+void MIXER_NativeDMAPayload(uint32_t address, uint32_t unit_bytes, bool decrement,
+                           const uint8_t *data, uint32_t bytes);
 void MIXER_NativeAudioEvent(unsigned kind, const char *source, int64_t a=0, int64_t b=0);
+// Optional FM state checkpoint after chip and OPL-mode setup; observation only.
+void MIXER_NativeFMCheckpoint(const MixerChannel *channel,uint32_t mode,uint32_t rate);
 
 #if C_DEBUG
 // Optional read-only committed-prefix evidence. No channel generation or

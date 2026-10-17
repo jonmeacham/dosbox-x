@@ -50,6 +50,9 @@
 #include "rawint.h"
 
 #include <map>
+#if !defined(WIN32) && !defined(C_EMSCRIPTEN) && defined(HAVE_UNISTD_H)
+#include <unistd.h>
+#endif
 
 #if (C_AVCODEC)
 extern "C" {
@@ -355,11 +358,23 @@ static struct {
 		Bitu used;
 		uint32_t length;
 		uint32_t freq;
+        FILE *pic_trace;
+        bool pic_trace_failed;
+        unsigned long long pic_trace_ordinal;
+        unsigned long long pic_frame_offset;
+        std::string pic_trace_final_path;
+        std::string pic_trace_temporary_path;
     } wave = {};
     struct {
         avi_writer  *writer;
 		Bitu		audiorate;
         std::map<std::string,size_t> name_to_stream_index;
+        FILE *pic_trace;
+        bool pic_trace_failed;
+        unsigned long long pic_trace_ordinal;
+        std::string pic_trace_final_path;
+        std::string pic_trace_temporary_path;
+        std::map<std::string,unsigned long long> pic_frame_offsets;
     } multitrack_wave = {};
 	struct {
 		FILE * handle;
@@ -387,6 +402,212 @@ static struct {
     } video = {};
 #endif
 } capture;
+
+extern unsigned long long mixer_sample_counter;
+
+static FILE *CapturePICSidecarOpen(const std::string &final_path, std::string &temporary_path) {
+    FILE *existing = fopen(final_path.c_str(), "rb");
+    if (existing != NULL) {
+        fclose(existing);
+        return NULL;
+    }
+    temporary_path = final_path + ".partial";
+    return fopen(temporary_path.c_str(), "wx");
+}
+
+static bool CapturePICSidecarPromote(const std::string &temporary_path, const std::string &final_path) {
+    FILE *existing = fopen(final_path.c_str(), "rb");
+    if (existing != NULL) {
+        fclose(existing);
+        return false;
+    }
+#if !defined(WIN32) && !defined(C_EMSCRIPTEN) && defined(HAVE_UNISTD_H)
+    if (link(temporary_path.c_str(), final_path.c_str()) != 0)
+        return false;
+    if (remove(temporary_path.c_str()) != 0)
+        LOG_MSG("Completed PIC sidecar but could not remove temporary alias: %s", temporary_path.c_str());
+    return true;
+#else
+    return rename(temporary_path.c_str(), final_path.c_str()) == 0;
+#endif
+}
+
+static bool CaptureWavePICEnabled(void) {
+    const char *value = getenv("DOSBOX_X_CAPTURE_WAV_PIC_TIMESTAMPS");
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
+static void CaptureWavePICFailure(const char *operation) {
+    if (!capture.wave.pic_trace_failed) {
+        LOG_MSG("WAV PIC sidecar incomplete: %s failed; inspect capture log", operation);
+        capture.wave.pic_trace_failed = true;
+    }
+}
+
+static void CaptureWavePICOpen(const std::string &wav_path) {
+    capture.wave.pic_trace = NULL;
+    capture.wave.pic_trace_failed = false;
+    capture.wave.pic_trace_ordinal = 0;
+    capture.wave.pic_frame_offset = 0;
+    if (!CaptureWavePICEnabled())
+        return;
+
+    capture.wave.pic_trace_final_path = wav_path + ".pic.csv";
+    capture.wave.pic_trace = CapturePICSidecarOpen(capture.wave.pic_trace_final_path,
+                                                    capture.wave.pic_trace_temporary_path);
+    if (capture.wave.pic_trace == NULL) {
+        CaptureWavePICFailure("exclusive open");
+        return;
+    }
+    if (fprintf(capture.wave.pic_trace,
+                "# schema=dosbox-x-wav-pic-v1; frame offsets count accepted copies into WAV buffer; PIC values are copy submission epochs\n"
+                "record_type,ordinal,wav_sample_rate_hz,source_sample_rate_hz,channels,frame_offset,frame_count,byte_count,pic_full_index_ms,pic_ticks,pic_tick_index,status\n") < 0 ||
+        fflush(capture.wave.pic_trace) != 0)
+        CaptureWavePICFailure("header write");
+}
+
+static void CaptureWavePICRecordCopy(Bitu frames, uint32_t source_rate) {
+    if (capture.wave.pic_trace == NULL)
+        return;
+    const char *status = source_rate == capture.wave.freq ? "" : "source_rate_mismatch";
+    if (status[0] != 0)
+        CaptureWavePICFailure("source rate changed during capture");
+    const int written = fprintf(capture.wave.pic_trace,
+        "copy,%llu,%u,%u,2,%llu,%u,%llu,%.17g,%llu,%.17g,%s\n",
+        capture.wave.pic_trace_ordinal++, capture.wave.freq, source_rate,
+        capture.wave.pic_frame_offset, (unsigned int)frames, (unsigned long long)frames * 4ULL,
+        (double)PIC_FullIndex(), (unsigned long long)PIC_Ticks, (double)PIC_TickIndex(), status);
+    capture.wave.pic_frame_offset += frames;
+    if (written < 0 || fflush(capture.wave.pic_trace) != 0)
+        CaptureWavePICFailure("copy row write");
+    else if (!capture.wave.pic_trace_failed && MIXER_NativeDMAPayloadTracing())
+        MIXER_NativeAudioEvent(15,"wav-copy",capture.wave.pic_frame_offset - frames,frames);
+}
+
+static void CaptureWavePICNoteDataWrite(size_t expected_bytes, int written) {
+    if (capture.wave.pic_trace != NULL && (written < 0 || (size_t)written != expected_bytes))
+        CaptureWavePICFailure("WAV data write");
+}
+
+static void CaptureWavePICClose(bool data_ended, int64_t actual_bytes) {
+    FILE *file = capture.wave.pic_trace;
+    if (file == NULL)
+        return;
+    if (actual_bytes < 0 || (unsigned long long)actual_bytes != capture.wave.pic_frame_offset * 4ULL)
+        CaptureWavePICFailure("accepted-frame/data-byte count mismatch");
+    if (!data_ended)
+        CaptureWavePICFailure("WAV end_data");
+    if (fprintf(file, "end,%llu,%u,%u,2,0,%llu,%llu,%.17g,%llu,%.17g,%s\n",
+                capture.wave.pic_trace_ordinal++, capture.wave.freq, capture.wave.freq,
+                capture.wave.pic_frame_offset, actual_bytes < 0 ? 0ULL : (unsigned long long)actual_bytes,
+                (double)PIC_FullIndex(), (unsigned long long)PIC_Ticks, (double)PIC_TickIndex(),
+                (data_ended && !capture.wave.pic_trace_failed) ? "complete" : "incomplete") < 0 ||
+        fflush(file) != 0)
+        CaptureWavePICFailure("footer write");
+
+    bool promote = data_ended && !capture.wave.pic_trace_failed;
+    if (fclose(file) != 0) {
+        CaptureWavePICFailure("close");
+        promote = false;
+    }
+    capture.wave.pic_trace = NULL;
+    if (promote && !capture.wave.pic_trace_failed) {
+        if (!CapturePICSidecarPromote(capture.wave.pic_trace_temporary_path,
+                                      capture.wave.pic_trace_final_path))
+            CaptureWavePICFailure("exclusive sidecar promotion");
+        else
+            LOG_MSG("Completed WAV PIC sidecar: %s", capture.wave.pic_trace_final_path.c_str());
+    } else {
+        LOG_MSG("WAV PIC sidecar retained as incomplete: %s",
+                capture.wave.pic_trace_temporary_path.c_str());
+    }
+}
+
+static bool CaptureMTWavePICEnabled(void) {
+    const char *value = getenv("DOSBOX_X_CAPTURE_MT_PIC_TIMESTAMPS");
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
+static void CaptureMTWavePICFailure(const char *operation) {
+    if (!capture.multitrack_wave.pic_trace_failed) {
+        LOG_MSG("Multitrack PIC sidecar incomplete: %s failed; inspect capture log", operation);
+        capture.multitrack_wave.pic_trace_failed = true;
+    }
+}
+
+static void CaptureMTWavePICClose(bool complete) {
+    FILE *file = capture.multitrack_wave.pic_trace;
+    if (file == NULL)
+        return;
+
+    for (std::map<std::string,unsigned long long>::const_iterator it = capture.multitrack_wave.pic_frame_offsets.begin();
+         it != capture.multitrack_wave.pic_frame_offsets.end(); ++it) {
+        std::map<std::string,size_t>::const_iterator stream = capture.multitrack_wave.name_to_stream_index.find(it->first);
+        unsigned long long chunks = 0, avi_frames = 0;
+        size_t stream_index = 0;
+        if (stream != capture.multitrack_wave.name_to_stream_index.end()) {
+            stream_index = stream->second;
+            if (capture.multitrack_wave.writer != NULL &&
+                stream_index < (size_t)capture.multitrack_wave.writer->avi_stream_alloc) {
+                avi_writer_stream *avi_stream = capture.multitrack_wave.writer->avi_stream + stream_index;
+                chunks = avi_stream->sample_write_chunk;
+                avi_frames = avi_stream->sample_write_offset / (2 * 2);
+            }
+        }
+        if (it->second != avi_frames)
+            CaptureMTWavePICFailure("sidecar/AVI frame count mismatch");
+        if (fprintf(file, "end,%llu,%s,%llu,%u,2,%u,0,%llu,%.17g,%llu,%.17g,%llu,%llu,%llu,%s\n",
+                    capture.multitrack_wave.pic_trace_ordinal++, it->first.c_str(),
+                    (unsigned long long)stream_index, (unsigned int)capture.multitrack_wave.audiorate,
+                    (unsigned int)capture.multitrack_wave.audiorate, it->second,
+                    (double)PIC_FullIndex(), (unsigned long long)PIC_Ticks,
+                    (double)PIC_TickIndex(), mixer_sample_counter, chunks, avi_frames,
+                    (complete && !capture.multitrack_wave.pic_trace_failed) ? "complete" : "incomplete") < 0 || fflush(file) != 0) {
+            CaptureMTWavePICFailure("footer write");
+            break;
+        }
+    }
+    bool promote = complete && !capture.multitrack_wave.pic_trace_failed;
+    if (fclose(file) != 0) {
+        CaptureMTWavePICFailure("close");
+        promote = false;
+    }
+    capture.multitrack_wave.pic_trace = NULL;
+    if (promote && !capture.multitrack_wave.pic_trace_failed) {
+        if (!CapturePICSidecarPromote(capture.multitrack_wave.pic_trace_temporary_path,
+                                      capture.multitrack_wave.pic_trace_final_path)) {
+            CaptureMTWavePICFailure("exclusive sidecar promotion");
+        } else {
+            LOG_MSG("Completed multitrack PIC sidecar: %s", capture.multitrack_wave.pic_trace_final_path.c_str());
+        }
+    } else {
+        LOG_MSG("Multitrack PIC sidecar retained as incomplete: %s", capture.multitrack_wave.pic_trace_temporary_path.c_str());
+    }
+}
+
+static void CaptureMTWavePICOpen(const std::string &avi_path) {
+    capture.multitrack_wave.pic_frame_offsets.clear();
+    capture.multitrack_wave.pic_trace_ordinal = 0;
+    capture.multitrack_wave.pic_trace_failed = false;
+    if (!CaptureMTWavePICEnabled())
+        return;
+
+    capture.multitrack_wave.pic_trace_final_path = avi_path + ".pic.csv";
+    capture.multitrack_wave.pic_trace_temporary_path = capture.multitrack_wave.pic_trace_final_path + ".partial";
+    capture.multitrack_wave.pic_trace = CapturePICSidecarOpen(
+        capture.multitrack_wave.pic_trace_final_path,
+        capture.multitrack_wave.pic_trace_temporary_path);
+    if (capture.multitrack_wave.pic_trace == NULL) {
+        CaptureMTWavePICFailure("open");
+        return;
+    }
+    FILE *file = capture.multitrack_wave.pic_trace;
+    if (fprintf(file, "# schema=dosbox-x-multitrack-pic-v1; offsets reset when AVI writer opens; PIC values are chunk submission epochs; mixer_submission_counter is not a per-sample frame base; only fully closed traces are promoted\nrecord_type,ordinal,stream_name,avi_stream_index,avi_sample_rate_hz,channels,source_sample_rate_hz,frame_offset,frame_count,pic_full_index_ms,pic_ticks,pic_tick_index,mixer_submission_counter,avi_chunk_count,avi_frame_count,status\n") < 0 || fflush(file) != 0)
+        CaptureMTWavePICFailure("header write");
+    for (std::map<std::string,size_t>::const_iterator it = capture.multitrack_wave.name_to_stream_index.begin();
+         it != capture.multitrack_wave.name_to_stream_index.end(); ++it)
+        capture.multitrack_wave.pic_frame_offsets[it->first] = 0;
+}
 
 #if (C_AVCODEC)
 unsigned int GFX_GetBShift();
@@ -1786,6 +2007,7 @@ void CAPTURE_MultiTrackAddWave(uint32_t freq, uint32_t len, int16_t * data,const
 			char fullpath[PATH_MAX];
 			if (realpath(path.c_str(), fullpath) != NULL) path = fullpath;
 #endif
+            CaptureMTWavePICOpen(path);
 			LOG_MSG("Started capturing multitrack audio (%u channels) to: %s",streams, path.c_str());
 		}
 
@@ -1796,20 +2018,48 @@ void CAPTURE_MultiTrackAddWave(uint32_t freq, uint32_t len, int16_t * data,const
 
 				if (index < (size_t)capture.multitrack_wave.writer->avi_stream_alloc) {
 					avi_writer_stream *os = capture.multitrack_wave.writer->avi_stream + index;
-					avi_writer_stream_write(capture.multitrack_wave.writer,os,data,len * 2 * 2,/*keyframe*/0x10);
+                    const int avi_written = avi_writer_stream_write(capture.multitrack_wave.writer,os,data,len * 2 * 2,/*keyframe*/0x10);
+                    if (capture.multitrack_wave.pic_trace != NULL) {
+                        const unsigned long long offset = capture.multitrack_wave.pic_frame_offsets[name];
+                        const char *record_type = avi_written ? "chunk" : "avi_rejected";
+                        const char *status = !avi_written ? "avi_write_failed" :
+                            (freq == capture.multitrack_wave.audiorate ? "" : "source_rate_mismatch");
+                        if (avi_written && freq != capture.multitrack_wave.audiorate)
+                            CaptureMTWavePICFailure("source rate changed during capture");
+                        const int written = fprintf(capture.multitrack_wave.pic_trace,
+                            "%s,%llu,%s,%llu,%u,2,%u,%llu,%u,%.17g,%llu,%.17g,%llu,,,%s\n",
+                            record_type, capture.multitrack_wave.pic_trace_ordinal++, name,
+                            (unsigned long long)index, (unsigned int)capture.multitrack_wave.audiorate,
+                            (unsigned int)freq, offset, (unsigned int)len, (double)PIC_FullIndex(),
+                            (unsigned long long)PIC_Ticks, (double)PIC_TickIndex(), mixer_sample_counter, status);
+                        if (avi_written)
+                            capture.multitrack_wave.pic_frame_offsets[name] = offset + len;
+                        else
+                            CaptureMTWavePICFailure("AVI chunk rejection");
+                        if (written < 0 || fflush(capture.multitrack_wave.pic_trace) != 0)
+                            CaptureMTWavePICFailure("chunk write");
+                        else if (avi_written && !capture.multitrack_wave.pic_trace_failed &&
+                                 MIXER_NativeDMAPayloadTracing())
+                            MIXER_NativeAudioEvent(16,name,offset,len);
+                    }
 				}
 				else {
 					LOG_MSG("Multitrack: Ignoring unknown track '%s', out of range\n",name);
+                    if (capture.multitrack_wave.pic_trace != NULL)
+                        CaptureMTWavePICFailure("unregistered stream index");
 				}
 			}
 			else {
 				LOG_MSG("Multitrack: Ignoring unknown track '%s'\n",name);
+                if (capture.multitrack_wave.pic_trace != NULL)
+                    CaptureMTWavePICFailure("unregistered stream submission");
 			}
 		}
 	}
 
 	return;
 skip_mt_wav:
+    CaptureMTWavePICClose(false);
 	capture.multitrack_wave.writer = avi_writer_destroy(capture.multitrack_wave.writer);
 #endif
 }
@@ -1938,6 +2188,7 @@ void CAPTURE_AddWave(uint32_t freq, uint32_t len, int16_t * data) {
             if (realpath(path.c_str(), fullpath) != NULL) path = fullpath;
 #endif
 			LOG_MSG("Started capturing wave output to: %s", path.c_str());
+			CaptureWavePICOpen(path);
 		}
 #if C_DEBUG
         // Header/format setup has succeeded. These are accepted copy frames,
@@ -1946,11 +2197,14 @@ void CAPTURE_AddWave(uint32_t freq, uint32_t len, int16_t * data) {
         MIXER_NativeCursorEvent("wav-copy",0,0,
             uint64_t(capture.wave.length) / 4u + uint64_t(capture.wave.used),len);
 #endif
+		const Bitu submitted_frames = len;
 		int16_t * read = data;
 		while (len > 0 ) {
 			Bitu left = WAVE_BUF - capture.wave.used;
 			if (!left) {
-				riff_wav_writer_data_write(capture.wave.writer,capture.wave.buf,2*2*WAVE_BUF);
+				const size_t expected_bytes = 2*2*WAVE_BUF;
+				const int written = riff_wav_writer_data_write(capture.wave.writer,capture.wave.buf,expected_bytes);
+				CaptureWavePICNoteDataWrite(expected_bytes, written);
 				capture.wave.length += 4*WAVE_BUF;
 				capture.wave.used = 0;
 				left = WAVE_BUF;
@@ -1962,6 +2216,7 @@ void CAPTURE_AddWave(uint32_t freq, uint32_t len, int16_t * data) {
 			read += left*2;
 			len -= (uint32_t)left;
 		}
+		CaptureWavePICRecordCopy(submitted_frames, freq);
 	}
 #endif
 }
@@ -1974,9 +2229,16 @@ void CAPTURE_MTWaveEvent(bool pressed) {
     if (CaptureState & CAPTURE_MULTITRACK_WAVE) {
         if (capture.multitrack_wave.writer != NULL) {
             LOG_MSG("Stopped capturing multitrack wave output.");
+            const int data_ended = avi_writer_end_data(capture.multitrack_wave.writer);
+            const int avi_finished = data_ended ? avi_writer_finish(capture.multitrack_wave.writer) : 0;
+            if (capture.multitrack_wave.pic_trace != NULL) {
+                if (!data_ended)
+                    CaptureMTWavePICFailure("AVI end_data");
+                if (!avi_finished)
+                    CaptureMTWavePICFailure("AVI finish");
+            }
+            CaptureMTWavePICClose(data_ended && avi_finished);
             capture.multitrack_wave.name_to_stream_index.clear();
-            avi_writer_end_data(capture.multitrack_wave.writer);
-            avi_writer_finish(capture.multitrack_wave.writer);
             avi_writer_close_file(capture.multitrack_wave.writer);
             capture.multitrack_wave.writer = avi_writer_destroy(capture.multitrack_wave.writer);
             CaptureState &= ~((unsigned int)CAPTURE_MULTITRACK_WAVE);
@@ -2020,9 +2282,14 @@ void CAPTURE_WaveEvent(bool pressed) {
         if (capture.wave.writer != NULL) {
             LOG_MSG("Stopped capturing wave output.");
             /* Write last piece of audio in buffer */
-            riff_wav_writer_data_write(capture.wave.writer,capture.wave.buf,2*2*capture.wave.used);
+            const size_t expected_bytes = 2*2*capture.wave.used;
+            const int written = riff_wav_writer_data_write(capture.wave.writer,capture.wave.buf,expected_bytes);
+            CaptureWavePICNoteDataWrite(expected_bytes, written);
             capture.wave.length+=(uint32_t)(capture.wave.used*4);
-            riff_wav_writer_end_data(capture.wave.writer);
+            const int64_t actual_bytes = riff_wav_writer_data_tell(capture.wave.writer);
+            const int data_ended = riff_wav_writer_end_data(capture.wave.writer);
+            riff_wav_writer_fsync(capture.wave.writer);
+            CaptureWavePICClose(data_ended != 0, actual_bytes);
             capture.wave.writer = riff_wav_writer_destroy(capture.wave.writer);
             CaptureState &= ~((unsigned int)CAPTURE_WAVE);
             if (show_recorded_filename && pathwav.size()) systemmessagebox("Recording completed",("Saved WAV output to the file:\n\n"+pathwav).c_str(),"ok", "info", 1);
