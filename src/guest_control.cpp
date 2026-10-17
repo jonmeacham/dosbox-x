@@ -9,6 +9,7 @@
 #include "pic.h"
 #include "mem.h"
 #include "paging.h"
+#include "mixer.h"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -263,6 +264,15 @@ void callback(Bitu value)
         break;
     case Event::Dump:
         error = dump(e);
+#if C_DEBUG
+        if (!error) {
+            // Observe the successful read at the current committed mixer prefix.
+            // No fill, guest write, or inferred sample-onset correction occurs.
+            MIXER_NativeAudioEvent(27, "memory-snapshot", e.address, e.length);
+            MIXER_NativeCursorEvent("memory-snapshot",
+                uint32_t(SegPhys(cs) + reg_eip), e.address, 0, 0);
+        }
+#endif
         break;
     case Event::Seed:
         if (mem_writed_checked(LinearPt(ALBION_SHARED_RNG_ADDRESS), e.seed))
