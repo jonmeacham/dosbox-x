@@ -2546,6 +2546,8 @@ static void capture_scheduled_exec_dumps() {
         // The original guest cue path, not a host UI timestamp, owns this row.
         MIXER_NativeCursorEvent("execution-snapshot",linear_ip,
                                request.snapshot_address,0,0);
+        MIXER_NativeAudioEvent(27,"execution-snapshot",linear_ip,
+                              request.snapshot_address);
 		if (++request.hits >= request.max_hits) {
 			close_scheduled_exec_dump(request);
 			it = scheduled_exec_dumps.erase(it);
